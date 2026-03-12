@@ -304,6 +304,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install tools
         run: |
@@ -686,6 +688,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       # ── Clone upstream source at the pinned SHA ────────────────────────────
       # UPSTREAM_REPO_SHA is tracked by Renovate — Merging a Renovate PR
@@ -993,6 +997,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -1156,6 +1162,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
         run: sudo apt-get update -qq && sudo apt-get install -y skopeo
@@ -1192,6 +1200,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
         run: sudo apt-get update -qq && sudo apt-get install -y skopeo
@@ -1241,6 +1251,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
         run: sudo apt-get update -qq && sudo apt-get install -y skopeo
@@ -1311,6 +1323,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync README → Docker Hub
         uses: peter-evans/dockerhub-description@v4
