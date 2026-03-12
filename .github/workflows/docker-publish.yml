@@ -972,6 +972,10 @@ jobs:
       contents: read
       packages: write
 
+    outputs:
+      primary_tag: ${{ steps.tags.outputs.primary_tag }}
+      date_tag:    ${{ steps.tags.outputs.date_tag }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -1074,6 +1078,7 @@ jobs:
 
       # ── Trivy security scan (non-blocking) ────────────────────────────────
       - name: Trivy vulnerability scan
+        id: trivy-scan
         if: github.event.inputs.run_security_scan != 'false'
         uses: aquasecurity/trivy-action@0.34.1
         with:
@@ -1085,7 +1090,11 @@ jobs:
         continue-on-error: true
 
       - name: Upload Trivy SARIF results
-        if: github.event.inputs.run_security_scan != 'false'
+        # Only upload if scan actually produced a file — skips when Trivy install fails
+        if: >
+          github.event.inputs.run_security_scan != 'false' &&
+          steps.trivy-scan.outcome == 'success' &&
+          hashFiles(format('trivy-{0}.sarif', matrix.version)) != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-${{ matrix.version }}.sarif'
@@ -1155,7 +1164,7 @@ jobs:
         with:
           dockerhub_repo: ${{ env.DOCKERHUB_REPO }}
           ghcr_repo:      ${{ env.GHCR_REPO }}
-          tags: latest,stable,${{ needs.check-releases.outputs.versions_to_build }}
+          tags: latest,stable,${{ needs.merge-manifest.outputs.primary_tag }},${{ needs.merge-manifest.outputs.date_tag }}
 
   # ============================================================================
   # Job 5 — Image promotion (version → latest/stable)
