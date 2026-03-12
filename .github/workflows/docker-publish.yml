@@ -170,6 +170,15 @@ on:
         type: boolean
         default: true
 
+# ── Default permissions for all jobs ─────────────────────────────────────────
+# actions: read  — required to download third-party actions (setup-qemu etc.)
+# contents: read — required to checkout code
+# packages: write — overridden per-job where needed
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
 # One auto-check at a time; version builds are grouped by versions input
 concurrency:
   group: docker-build-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.versions || 'auto-check' }}
@@ -359,7 +368,7 @@ jobs:
       - name: Check existing images by commit SHA
         id: check-existing
         run: |
-          CURRENT_SHA="${{ github.sha }}"
+          CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
           SHORT_SHA="${CURRENT_SHA:0:7}"
 
           echo "Checking registries for commit: $CURRENT_SHA (sha-${SHORT_SHA})"
@@ -517,7 +526,7 @@ jobs:
 
               # PRIMARY gate: commit SHA already in BOTH registries → hard skip
               if [[ "$COMMIT_PUBLISHED" == "true" && "$FORCE" != "true" ]]; then
-                echo "⏭️  Commit ${{ github.sha }} already published to both registries — SKIPPING"
+                echo "⏭️  Commit ${{ env.UPSTREAM_REPO_SHA }} already published to both registries — SKIPPING"
                 SHOULD="false"
 
               # Partial: commit in one registry only → build to sync the other
@@ -631,7 +640,7 @@ jobs:
             echo "| Property | Value |"
             echo "|---|---|"
             echo "| Action | ${{ steps.set-action.outputs.action }} |"
-            echo "| Commit SHA | \`${{ github.sha }}\` |"
+            echo "| Workflow SHA | \`${{ github.sha }}\` |"
             echo "| Upstream SHA | \`${{ env.UPSTREAM_REPO_SHA }}\` |"
             echo "| Upstream Repo | [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-server/commit/${{ env.UPSTREAM_REPO_SHA }}) |"
             echo "| Commit Published | ${{ steps.check-existing.outputs.commit_published }} |"
@@ -784,7 +793,7 @@ jobs:
         id: build-tag
         run: |
           DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
-          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
           SHORT_SHA="${SHORT_SHA:0:7}"
           AUTO_TAG="${DATE}-${SHORT_SHA}"
 
@@ -831,7 +840,7 @@ jobs:
             org.opencontainers.image.upstream.repo=https://github.com/FreePeak/db-mcp-server
             org.opencontainers.image.upstream.revision=${{ env.UPSTREAM_REPO_SHA }}
             org.opencontainers.image.documentation=https://github.com/FreePeak/db-mcp-server
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ env.UPSTREAM_REPO_SHA }}
 
       # ── Get base image digest for change-tracking label ───────────────────
       - name: Get base image digest
@@ -889,7 +898,7 @@ jobs:
             BUILDKIT_MULTI_PLATFORM=1
             BUILDKIT_MAX_PARALLELISM=${{ steps.resources.outputs.opt_cpu }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
-            VCS_REF=${{ github.sha }}
+            VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
           # Two-tier cache: GHCR registry cache + GHA cache
           cache-from: |
@@ -1009,7 +1018,7 @@ jobs:
         id: tags
         run: |
           DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
-          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
           SHORT_SHA="${SHORT_SHA:0:7}"
           AUTO_TAG="${DATE}-${SHORT_SHA}"
 
@@ -1110,7 +1119,7 @@ jobs:
             echo "| Primary Tag | \`${{ steps.tags.outputs.primary_tag }}\` |"
             echo "| Date Tag | ${{ steps.tags.outputs.date_tag }} |"
             echo "| Short SHA | ${{ steps.tags.outputs.short_sha }} |"
-            echo "| Commit | ${{ github.sha }} |"
+            echo "| Upstream Commit | ${{ env.UPSTREAM_REPO_SHA }} |"
             echo "| Compression | ${{ needs.check-releases.outputs.compression_params }} |"
             echo "| Platforms | ${{ needs.check-releases.outputs.platforms }} |"
             echo ""

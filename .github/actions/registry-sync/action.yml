@@ -176,9 +176,9 @@ runs:
       if: always()
       shell: bash
       run: |
-        echo "## 🔄 Registry Sync: ${{ inputs.dockerhub_repo }}" >> "$GITHUB_STEP_SUMMARY"
-        echo "| Tag(s) | Status |"                               >> "$GITHUB_STEP_SUMMARY"
-        echo "|---|---|"                                          >> "$GITHUB_STEP_SUMMARY"
-        for t in ${{ steps.sync.outputs.synced_tags }};  do echo "| $t | ✅ Synced |"  >> "$GITHUB_STEP_SUMMARY"; done
-        for t in ${{ steps.sync.outputs.skipped_tags }}; do echo "| $t | ⏭️ Skipped |" >> "$GITHUB_STEP_SUMMARY"; done
-        for t in ${{ steps.sync.outputs.failed_tags }};  do echo "| $t | ❌ Failed |"  >> "$GITHUB_STEP_SUMMARY"; done
+        echo "## Registry Sync: ${{ inputs.dockerhub_repo }}" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Tag(s) | Status |"                              >> "$GITHUB_STEP_SUMMARY"
+        echo "|---|---|"                                         >> "$GITHUB_STEP_SUMMARY"
+        for t in ${{ steps.sync.outputs.synced_tags }};  do echo "| $t | Synced |"  >> "$GITHUB_STEP_SUMMARY"; done
+        for t in ${{ steps.sync.outputs.skipped_tags }}; do echo "| $t | Skipped |" >> "$GITHUB_STEP_SUMMARY"; done
+        for t in ${{ steps.sync.outputs.failed_tags }};  do echo "| $t | Failed |"  >> "$GITHUB_STEP_SUMMARY"; done
