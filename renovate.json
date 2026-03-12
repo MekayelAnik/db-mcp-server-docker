@@ -40,7 +40,6 @@
       ],
       "enabled": false
     },
-
     {
       "description": "GitHub Actions — major versions only (e.g. @v4 → @v5). Never automerge, never update minor/patch.",
       "matchManagers": [
@@ -63,7 +62,6 @@
       "automerge": false,
       "minimumReleaseAge": "7 days"
     },
-
     {
       "description": "Security-related actions — major only, high priority",
       "matchManagers": [
@@ -145,7 +143,6 @@
         "!/^github\\/codeql/"
       ]
     },
-
     {
       "description": "Dockerfile base images — group all into one PR, require manual review",
       "matchManagers": [
@@ -165,7 +162,6 @@
         "tonistiigi/xx"
       ]
     },
-
     {
       "description": "Automerge minor and patch for non-actions, non-dockerfile stable packages",
       "matchManagers": [
@@ -182,13 +178,12 @@
       "automergeStrategy": "squash"
     }
   ],
-
   "customManagers": [
     {
       "description": "Track upstream FreePeak/db-mcp-server repo for new commits — triggers workflow dispatch on new main branch SHA",
       "customType": "regex",
-      "fileMatch": [
-        "^\\.github/workflows/docker-publish\\.yml$"
+      "managerFilePatterns": [
+        "/^\\.github/workflows/docker-publish\\.yml$/"
       ],
       "matchStrings": [
         "UPSTREAM_REPO_SHA:\\s*(?<currentValue>[a-f0-9]{40})"
@@ -199,7 +194,6 @@
       "versioningTemplate": "git"
     }
   ],
-
   "commitMessagePrefix": "ci: ",
   "commitMessageAction": "update",
   "commitMessageTopic": "{{depName}}",
