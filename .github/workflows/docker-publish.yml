@@ -1,0 +1,1304 @@
+# .github/workflows/docker-publish.yml
+# =============================================================================
+# db-mcp-server — Docker Build & Publish
+# =============================================================================
+#
+# Merged feature set from:
+#   • ispyagentdvr docker-build.yml   (scheduling, promotion, sync, scan)
+#   • ispyagentdvr-docker.sh          (BuildKit tuning, compression profiles)
+#   • registry-login / registry-sync  (composite actions)
+#
+# Triggers
+# ─────────────────────────────────────────────────────────────────────────────
+#   schedule (*/30)   → auto-check: builds only if image is missing
+#   repository_dispatch               → same as schedule (external cron support)
+#   push main         → :latest + :sha-<short>
+#   push vX.Y.Z tag   → :vX.Y.Z + :X.Y + :X + :latest
+#   pull_request      → build-only (no push), validates image
+#   workflow_dispatch → manual with full action + profile selection
+#
+# Required Secrets  (Settings → Secrets → Actions)
+# ─────────────────────────────────────────────────────────────────────────────
+#   DOCKERHUB_USERNAME    Docker Hub username
+#   DOCKERHUB_TOKEN       Docker Hub access token (not your password)
+#   GITHUB_TOKEN          Provided automatically (packages:write scope)
+#
+# Repository Variables  (Settings → Secrets and variables → Variables)
+# ─────────────────────────────────────────────────────────────────────────────
+#   TZ                    Timezone for date tags          (default: Asia/Dhaka)
+#   DOCKERHUB_REPO        Full DH repo name               (default: below)
+#   GHCR_REPO             Full GHCR repo name             (default: below)
+#   DEFAULT_PLATFORMS     Comma-separated platform list   (default: below)
+#   UPDATE_BASE_IMAGE_ENABLED  'true' to auto-rebuild on base changes
+# =============================================================================
+
+name: Docker Build & Publish
+
+on:
+  # ── Time-based: check for new upstream releases every 30 minutes ───────────
+  schedule:
+    - cron: '*/30 * * * *'
+
+  # ── External cron (cron-job.org / similar) ──────────────────────────────────
+  repository_dispatch:
+    types: [Docker Build & Publish - Cron Scheduled]
+
+  # ── Code pushes ─────────────────────────────────────────────────────────────
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+
+  pull_request:
+    branches:
+      - main
+
+  # ── Manual dispatch ─────────────────────────────────────────────────────────
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - auto-check
+          - build-versions
+          - promote-image
+          - sync-registries
+          - mark-stable
+        default: auto-check
+
+      build_profile:
+        description: 'Build profile (controls compression + resource limits)'
+        required: false
+        type: choice
+        options:
+          - production
+          - ci
+          - development
+          - size-optimized
+        default: production
+
+      versions:
+        description: |
+          Versions to build (build-versions only)
+          Single: 1.8.0 | Multiple: 1.7.0,1.8.0 | Range: 1.7.0-1.8.0
+        required: false
+        type: string
+        default: ''
+
+      promote_version:
+        description: 'Source version to promote (promote-image only)'
+        required: false
+        type: string
+        default: ''
+
+      promote_tag:
+        description: 'Target promotion tag'
+        required: false
+        type: choice
+        options:
+          - latest
+          - stable
+        default: latest
+
+      force_build:
+        description: 'Force rebuild even if image already exists'
+        required: false
+        type: boolean
+        default: false
+
+      skip_existing:
+        description: 'Skip versions already present in both registries'
+        required: false
+        type: boolean
+        default: true
+
+      run_security_scan:
+        description: 'Run Trivy vulnerability scan (non-blocking)'
+        required: false
+        type: boolean
+        default: true
+
+      push_to_dockerhub:
+        description: 'Push to Docker Hub'
+        required: false
+        type: boolean
+        default: true
+
+      push_to_ghcr:
+        description: 'Push to GitHub Container Registry'
+        required: false
+        type: boolean
+        default: true
+
+      update_base_image:
+        description: 'Rebuild if base image digest has changed'
+        required: false
+        type: boolean
+        default: false
+
+      platforms:
+        description: 'Target platforms'
+        required: false
+        type: choice
+        options:
+          - 'linux/amd64,linux/arm64,linux/arm/v7'
+          - 'linux/amd64,linux/arm64'
+          - 'linux/amd64'
+        default: 'linux/amd64,linux/arm64,linux/arm/v7'
+
+      compression_level:
+        description: 'Compression level (zstd: 1–22, gzip: 1–9). Default: 22'
+        required: false
+        type: string
+        default: '22'
+
+      custom_tag:
+        description: |
+          Custom image tag — replaces the auto-generated YYYYMMDD-<sha> tag.
+          Example: 1.8.0-beta, v2.0.0, hotfix-xyz
+          Leave blank to use the auto-generated tag.
+        required: false
+        type: string
+        default: ''
+
+      tag_as_latest:
+        description: 'Also push as :latest tag'
+        required: false
+        type: boolean
+        default: true
+
+# One auto-check at a time; version builds are grouped by versions input
+concurrency:
+  group: docker-build-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.versions || 'auto-check' }}
+  cancel-in-progress: false
+
+env:
+  TZ:               ${{ vars.TZ               || 'Asia/Dhaka' }}
+  DOCKERHUB_REPO:   ${{ vars.DOCKERHUB_REPO   || 'your-dockerhub-user/db-mcp-server' }}
+  GHCR_REPO:        ${{ vars.GHCR_REPO        || 'ghcr.io/your-github-user/db-mcp-server' }}
+  DEFAULT_PLATFORMS: ${{ vars.DEFAULT_PLATFORMS || 'linux/amd64,linux/arm64,linux/arm/v7' }}
+  UPDATE_BASE_IMAGE_ENABLED: ${{ vars.UPDATE_BASE_IMAGE_ENABLED || 'false' }}
+
+  # ── Upstream source tracking ──────────────────────────────────────────────
+  # Renovate watches this SHA and opens a PR when FreePeak/db-mcp-server
+  # receives a new commit on main. Merging the PR triggers a new build.
+  # renovate: datasource=git-refs depName=FreePeak/db-mcp-server packageName=https://github.com/FreePeak/db-mcp-server
+  UPSTREAM_REPO_SHA: 19b7975d0ea203ea3be5cbda9b5e22997c0d92b5
+
+  # ── BuildKit performance knobs (from ispyagentdvr-docker.sh) ─────────────
+  BUILDKIT_STEP_LOG_MAX_SIZE:   "50000000"    # 50 MB log buffer
+  BUILDKIT_STEP_LOG_MAX_SPEED:  "100000000"   # 100 MB/s max log speed
+  BUILDKIT_PROGRESS:            plain
+  DOCKER_BUILDKIT_INLINE_CACHE: "1"
+  BUILDKIT_INLINE_CACHE:        "1"
+  BUILDKIT_MULTI_PLATFORM:      "1"
+  BUILDKIT_HTTP_TIMEOUT:        "300"
+  BUILDKIT_REGISTRY_RETRY_COUNT: "3"
+  BUILDKIT_GC_KEEP_DURATION:    "168h"        # 7 days
+
+  # ── Export concurrency ────────────────────────────────────────────────────
+  EXPORT_CACHE_CONCURRENCY:  "4"
+  EXPORT_LAYERS_CONCURRENCY: "4"
+
+jobs:
+  # ============================================================================
+  # Job 0 — Resolve build profile
+  # Mirrors apply_build_profile() + build-compression-params() from .sh script
+  # ============================================================================
+  resolve-profile:
+    name: Resolve build profile
+    runs-on: ubuntu-latest
+    outputs:
+      compression_type:    ${{ steps.profile.outputs.compression_type }}
+      compression_level:   ${{ steps.profile.outputs.compression_level }}
+      compression_params:  ${{ steps.profile.outputs.compression_params }}
+      gc_keep_storage:     ${{ steps.profile.outputs.gc_keep_storage }}
+      build_retry_count:   ${{ steps.profile.outputs.build_retry_count }}
+      build_timeout_min:   ${{ steps.profile.outputs.build_timeout_min }}
+      resource_limit_pct:  ${{ steps.profile.outputs.resource_limit_pct }}
+
+    steps:
+      - name: Apply build profile
+        id: profile
+        run: |
+          # workflow_dispatch may supply both profile and compression_level overrides
+          PROFILE="${{ github.event.inputs.build_profile || 'production' }}"
+          LEVEL_OVERRIDE="${{ github.event.inputs.compression_level }}"
+
+          case "$PROFILE" in
+            development|dev)
+              CT=gzip;  CL=1;  GC=5GB;  RC=1; TO=60;  RL=50 ;;
+            ci|continuous-integration)
+              CT=zstd;  CL=3;  GC=8GB;  RC=2; TO=60;  RL=75 ;;
+            size-optimized)
+              CT=gzip;  CL=9;  GC=20GB; RC=3; TO=120; RL=90 ;;
+            production|prod|*)
+              CT=zstd;  CL=22; GC=15GB; RC=3; TO=120; RL=95 ;;
+          esac
+
+          # Manual level override takes precedence (workflow_dispatch compression_level input)
+          [[ -n "$LEVEL_OVERRIDE" ]] && CL="$LEVEL_OVERRIDE"
+
+          # Build the output string passed to --output (mirrors build-compression-params)
+          case "$CT" in
+            zstd)
+              CP="compression=zstd,compression-level=${CL},force-compression=true" ;;
+            gzip)
+              CP="compression=gzip,compression-level=${CL},force-compression=true" ;;
+            estargz-zstd|estargz-gzip|estargz)
+              CP="compression=estargz,estargz-compression-level=${CL},estargz-chunk-size=4194304,force-compression=true" ;;
+            uncompressed|none)
+              CP="compression=uncompressed" ;;
+            *)
+              CT=zstd; CL=3
+              CP="compression=zstd,compression-level=3,force-compression=true" ;;
+          esac
+
+          echo "compression_type=$CT"   >> "$GITHUB_OUTPUT"
+          echo "compression_level=$CL"  >> "$GITHUB_OUTPUT"
+          echo "compression_params=$CP" >> "$GITHUB_OUTPUT"
+          echo "gc_keep_storage=$GC"    >> "$GITHUB_OUTPUT"
+          echo "build_retry_count=$RC"  >> "$GITHUB_OUTPUT"
+          echo "build_timeout_min=$TO"  >> "$GITHUB_OUTPUT"
+          echo "resource_limit_pct=$RL" >> "$GITHUB_OUTPUT"
+
+          echo "Profile=$PROFILE → $CT:$CL | gc=$GC | retry=$RC | timeout=${TO}m | resources=${RL}%"
+
+  # ============================================================================
+  # Job 1 — Pre-flight validation + check existing images
+  # Mirrors check_dependencies() + validate_build_environment() + check-existing
+  # ============================================================================
+  check-releases:
+    name: Check Releases & Validate
+    runs-on: ubuntu-latest
+    needs: resolve-profile
+    outputs:
+      versions_to_build:  ${{ steps.determine-versions.outputs.versions }}
+      versions_json:      ${{ steps.determine-versions.outputs.versions_json }}
+      should_build:       ${{ steps.determine-versions.outputs.should_build }}
+      build_matrix:       ${{ steps.generate-matrix.outputs.matrix }}
+      should_mark_stable: ${{ steps.check-stable.outputs.should_mark_stable }}
+      stable_version:     ${{ steps.check-stable.outputs.stable_version }}
+      action_type:        ${{ steps.set-action.outputs.action }}
+      platforms:          ${{ steps.set-platforms.outputs.platforms }}
+      compression_level:  ${{ needs.resolve-profile.outputs.compression_level }}
+      compression_params: ${{ needs.resolve-profile.outputs.compression_params }}
+      gc_keep_storage:    ${{ needs.resolve-profile.outputs.gc_keep_storage }}
+      build_timeout_min:  ${{ needs.resolve-profile.outputs.build_timeout_min }}
+      resource_limit_pct: ${{ needs.resolve-profile.outputs.resource_limit_pct }}
+      commit_published:   ${{ steps.check-existing.outputs.commit_published }}
+      head_sha_short:     ${{ steps.check-existing.outputs.head_sha_short }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y curl jq skopeo
+
+      - name: Set action type
+        id: set-action
+        run: |
+          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            echo "action=auto-check" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "action=auto-check" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "action=auto-check" >> "$GITHUB_OUTPUT"
+          else
+            echo "action=${{ github.event.inputs.action }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set platforms
+        id: set-platforms
+        run: |
+          P="${{ github.event.inputs.platforms }}"
+          echo "platforms=${P:-${{ env.DEFAULT_PLATFORMS }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate compression config
+        run: |
+          CT="${{ needs.resolve-profile.outputs.compression_type }}"
+          CL="${{ needs.resolve-profile.outputs.compression_level }}"
+          case "$CT" in
+            zstd)
+              [[ "$CL" -ge 1 && "$CL" -le 22 ]] && echo "✅ zstd level $CL" \
+                || { echo "❌ zstd level $CL out of range (1-22)"; exit 1; } ;;
+            gzip)
+              [[ "$CL" -ge 1 && "$CL" -le 9 ]]  && echo "✅ gzip level $CL" \
+                || { echo "❌ gzip level $CL out of range (1-9)";  exit 1; } ;;
+            *) echo "✅ $CT (no level validation needed)" ;;
+          esac
+
+      - name: Validate build environment
+        run: |
+          echo "=== Dependencies ==="
+          for dep in docker curl skopeo jq; do
+            command -v "$dep" &>/dev/null && echo "✅ $dep" || { echo "❌ $dep missing"; exit 1; }
+          done
+          docker buildx version &>/dev/null && echo "✅ docker buildx" || { echo "❌ docker buildx missing"; exit 1; }
+
+          echo "=== Disk space ==="
+          AVAIL=$(df . | awk 'NR==2 {print int($4/1024/1024)}')
+          [[ $AVAIL -lt 10 ]] && echo "⚠️  Only ${AVAIL}GB available (10GB+ recommended)" \
+                              || echo "✅ ${AVAIL}GB available"
+          echo "✅ Pre-flight complete"
+
+      - name: Login to registries
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check existing images by commit SHA
+        id: check-existing
+        run: |
+          CURRENT_SHA="${{ github.sha }}"
+          SHORT_SHA="${CURRENT_SHA:0:7}"
+
+          echo "Checking registries for commit: $CURRENT_SHA (sha-${SHORT_SHA})"
+
+          # Helper: return the org.opencontainers.image.revision label of an image, or empty
+          get_revision() {
+            skopeo inspect "docker://$1" 2>/dev/null \
+              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' \
+              || echo ""
+          }
+
+          # Check :latest on both registries — compare their revision label to HEAD SHA
+          DH_REF="${{ env.DOCKERHUB_REPO }}:latest"
+          GC_REF="${{ env.GHCR_REPO }}:latest"
+
+          DH_SHA=$(get_revision "$DH_REF")
+          GC_SHA=$(get_revision "$GC_REF")
+
+          echo "Docker Hub :latest revision = '${DH_SHA:-<not found>}'"
+          echo "GHCR       :latest revision = '${GC_SHA:-<not found>}'"
+
+          # An image is "current" if its revision label matches HEAD SHA exactly
+          DH_CURRENT="false"; GC_CURRENT="false"
+          [[ "$DH_SHA" == "$CURRENT_SHA" ]] && DH_CURRENT="true"
+          [[ "$GC_SHA" == "$CURRENT_SHA" ]] && GC_CURRENT="true"
+
+          # Also expose existence (for downstream steps that still need it)
+          DH_EXISTS=$(skopeo inspect "docker://$DH_REF" &>/dev/null && echo exists || echo missing)
+          GC_EXISTS=$(skopeo inspect "docker://$GC_REF" &>/dev/null && echo exists || echo missing)
+
+          echo "dockerhub_status=$DH_EXISTS"   >> "$GITHUB_OUTPUT"
+          echo "ghcr_status=$GC_EXISTS"        >> "$GITHUB_OUTPUT"
+          echo "dockerhub_current=$DH_CURRENT" >> "$GITHUB_OUTPUT"
+          echo "ghcr_current=$GC_CURRENT"      >> "$GITHUB_OUTPUT"
+          echo "head_sha=$CURRENT_SHA"         >> "$GITHUB_OUTPUT"
+          echo "head_sha_short=sha-$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          if [[ "$DH_CURRENT" == "true" && "$GC_CURRENT" == "true" ]]; then
+            echo "commit_published=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Commit $SHORT_SHA already published to both registries — will SKIP build"
+          elif [[ "$DH_CURRENT" == "true" || "$GC_CURRENT" == "true" ]]; then
+            echo "commit_published=partial" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Commit $SHORT_SHA published to one registry only — will BUILD for the other"
+          else
+            echo "commit_published=false" >> "$GITHUB_OUTPUT"
+            echo "🔨 Commit $SHORT_SHA not yet published — will BUILD"
+          fi
+
+      - name: Check base image for updates
+        id: check-base-image
+        run: |
+          UPDATE_ENABLED="${{ github.event.inputs.update_base_image || env.UPDATE_BASE_IMAGE_ENABLED }}"
+          if [[ "$UPDATE_ENABLED" != "true" ]]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "Base image update check disabled"
+            exit 0
+          fi
+
+          # Get Dockerfile base image
+          BASE_IMAGE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
+          if [[ -z "$BASE_IMAGE" ]]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  Could not determine base image from Dockerfile"
+            exit 0
+          fi
+          echo "Base image: $BASE_IMAGE"
+
+          BASE_DIGEST=$(skopeo inspect "docker://${BASE_IMAGE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
+          echo "Base digest: $BASE_DIGEST"
+
+          CURRENT_IMAGE="${{ env.DOCKERHUB_REPO }}:latest"
+          CURRENT_BASE=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null \
+            | jq -r '.Labels["org.opencontainers.image.base.digest"] // empty' || echo "")
+
+          if [[ -z "$CURRENT_BASE" ]]; then
+            # Fallback: timestamp comparison
+            CURRENT_CREATED=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null | jq -r '.Created' || echo "")
+            BASE_CREATED=$(skopeo inspect "docker://${BASE_IMAGE}" 2>/dev/null | jq -r '.Created' || echo "")
+            CE=$(date -d "$CURRENT_CREATED" +%s 2>/dev/null || echo "0")
+            BE=$(date -d "$BASE_CREATED"    +%s 2>/dev/null || echo "0")
+            [[ $BE -gt $CE ]] && echo "updated=true" >> "$GITHUB_OUTPUT" \
+                              || echo "updated=false" >> "$GITHUB_OUTPUT"
+          else
+            [[ "$CURRENT_BASE" != "$BASE_DIGEST" ]] \
+              && echo "updated=true"  >> "$GITHUB_OUTPUT" \
+              || echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check 5-day stable promotion eligibility
+        id: check-stable
+        run: |
+          # Read current :latest image creation date from GHCR
+          LATEST_CREATED=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+            | jq -r '.Created' || echo "")
+
+          if [[ -z "$LATEST_CREATED" ]]; then
+            echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
+            echo "stable_version="          >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LATEST_EPOCH=$(date -d "$LATEST_CREATED" +%s 2>/dev/null || echo "0")
+          NOW=$(date +%s)
+          FIVE_DAYS=$(( 5 * 24 * 3600 ))
+          DAYS_OLD=$(( (NOW - LATEST_EPOCH) / 86400 ))
+
+          # Get the version label from the current latest image
+          LATEST_VERSION=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+            | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+
+          echo "Latest image is $DAYS_OLD days old (version: ${LATEST_VERSION:-unknown})"
+
+          if [[ $LATEST_EPOCH -gt 0 && $(( NOW - LATEST_EPOCH )) -ge $FIVE_DAYS ]]; then
+            echo "should_mark_stable=true"         >> "$GITHUB_OUTPUT"
+            echo "stable_version=$LATEST_VERSION"  >> "$GITHUB_OUTPUT"
+            echo "✅ Eligible for stable promotion"
+          else
+            echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
+            echo "stable_version="          >> "$GITHUB_OUTPUT"
+            echo "Not yet eligible (< 5 days)"
+          fi
+
+      - name: Determine versions to build
+        id: determine-versions
+        run: |
+          ACTION="${{ steps.set-action.outputs.action }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+          SKIP_EXISTING="${{ github.event.inputs.skip_existing || 'true' }}"
+          BASE_UPDATED="${{ steps.check-base-image.outputs.updated }}"
+          UPDATE_ENABLED="${{ github.event.inputs.update_base_image || env.UPDATE_BASE_IMAGE_ENABLED }}"
+
+          # For git-tag pushes, version = tag name (strip leading 'v')
+          GIT_TAG_VERSION=""
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            GIT_TAG_VERSION="${{ github.ref_name }}"
+            GIT_TAG_VERSION="${GIT_TAG_VERSION#v}"
+          fi
+
+          case "$ACTION" in
+            auto-check)
+              COMMIT_PUBLISHED="${{ steps.check-existing.outputs.commit_published }}"
+              DH_CURRENT="${{ steps.check-existing.outputs.dockerhub_current }}"
+              GC_CURRENT="${{ steps.check-existing.outputs.ghcr_current }}"
+
+              # Determine the version label to use for this build
+              if [[ -n "$GIT_TAG_VERSION" ]]; then
+                BUILD_VER="$GIT_TAG_VERSION"
+              else
+                BUILD_VER=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+                  | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+                [[ -z "$BUILD_VER" ]] && BUILD_VER="latest-from-source"
+              fi
+
+              SHOULD="false"
+
+              # PRIMARY gate: commit SHA already in BOTH registries → hard skip
+              if [[ "$COMMIT_PUBLISHED" == "true" && "$FORCE" != "true" ]]; then
+                echo "⏭️  Commit ${{ github.sha }} already published to both registries — SKIPPING"
+                SHOULD="false"
+
+              # Partial: commit in one registry only → build to sync the other
+              elif [[ "$COMMIT_PUBLISHED" == "partial" ]]; then
+                echo "🔄 Commit published to one registry — building to sync the other"
+                SHOULD="true"
+
+              # Not published yet → normal build
+              elif [[ "$COMMIT_PUBLISHED" == "false" ]]; then
+                echo "🔨 New commit — building"
+                SHOULD="true"
+              fi
+
+              # Override gates
+              [[ "$FORCE" == "true" ]] && { echo "⚡ Force build requested"; SHOULD="true"; }
+              [[ "$BASE_UPDATED" == "true" && "$UPDATE_ENABLED" == "true" ]] && {
+                echo "🔄 Base image updated — rebuilding"
+                SHOULD="true"
+              }
+
+              echo "versions=$BUILD_VER"           >> "$GITHUB_OUTPUT"
+              echo "versions_json=[\"$BUILD_VER\"]" >> "$GITHUB_OUTPUT"
+              echo "should_build=$SHOULD"           >> "$GITHUB_OUTPUT"
+              ;;
+
+            build-versions)
+              INPUT="${{ github.event.inputs.versions }}"
+              if [[ -z "$INPUT" ]]; then
+                echo "versions=" >> "$GITHUB_OUTPUT"
+                echo "versions_json=[]" >> "$GITHUB_OUTPUT"
+                echo "should_build=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              # Range detection: X.Y.Z-A.B.C format
+              if [[ "$INPUT" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                # Simple range for semver — treat as two-version list (start,end)
+                START=$(echo "$INPUT" | cut -d'-' -f1)
+                END=$(echo "$INPUT" | cut -d'-' -f2)
+                INPUT="$START,$END"
+              fi
+
+              # Filter existing if skip_existing
+              FILTERED=""
+              IFS=',' read -ra ARR <<< "$INPUT"
+              for ver in "${ARR[@]}"; do
+                ver=$(echo "$ver" | xargs)
+                if [[ "$SKIP_EXISTING" == "true" && "$FORCE" != "true" ]]; then
+                  DH=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${ver}" &>/dev/null && echo yes || echo no)
+                  GC=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:${ver}"     &>/dev/null && echo yes || echo no)
+                  if [[ "$DH" == "yes" && "$GC" == "yes" ]]; then
+                    echo "::notice::Skipping $ver — already in both registries"
+                    continue
+                  fi
+                fi
+                FILTERED="${FILTERED:+$FILTERED,}$ver"
+              done
+
+              if [[ -z "$FILTERED" ]]; then
+                echo "versions=" >> "$GITHUB_OUTPUT"
+                echo "versions_json=[]" >> "$GITHUB_OUTPUT"
+                echo "should_build=false" >> "$GITHUB_OUTPUT"
+              else
+                JSON=$(echo "$FILTERED" | sed 's/,/","/g; s/^/["/; s/$/"]/') 
+                echo "versions=$FILTERED"      >> "$GITHUB_OUTPUT"
+                echo "versions_json=$JSON"     >> "$GITHUB_OUTPUT"
+                echo "should_build=true"       >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+
+            promote-image|sync-registries|mark-stable)
+              echo "versions="       >> "$GITHUB_OUTPUT"
+              echo "versions_json=[]" >> "$GITHUB_OUTPUT"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Generate build matrix
+        id: generate-matrix
+        run: |
+          VERSIONS='${{ steps.determine-versions.outputs.versions_json }}'
+          PLATFORMS="${{ steps.set-platforms.outputs.platforms }}"
+
+          if [[ "$VERSIONS" == "[]" || -z "$VERSIONS" ]]; then
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build [{version, platform, platform_slug}, ...]
+          PLATFORM_JSON=$(echo "$PLATFORMS" | jq -Rc 'split(",")')
+          MATRIX=$(echo "$VERSIONS" | jq -c --argjson plats "$PLATFORM_JSON" '
+            . as $vers |
+            [
+              $vers[] as $v |
+              $plats[] as $p |
+              {
+                version: $v,
+                platform: $p,
+                platform_slug: ($p | gsub("/"; "-"))
+              }
+            ]
+          ')
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $(echo $MATRIX | jq length) entries"
+
+      - name: Preflight summary
+        run: |
+          {
+            echo "## 🔍 Release Check Summary"
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Action | ${{ steps.set-action.outputs.action }} |"
+            echo "| Commit SHA | \`${{ github.sha }}\` |"
+            echo "| Upstream SHA | \`${{ env.UPSTREAM_REPO_SHA }}\` |"
+            echo "| Upstream Repo | [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-server/commit/${{ env.UPSTREAM_REPO_SHA }}) |"
+            echo "| Commit Published | ${{ steps.check-existing.outputs.commit_published }} |"
+            echo "| Docker Hub current | ${{ steps.check-existing.outputs.dockerhub_current }} |"
+            echo "| GHCR current | ${{ steps.check-existing.outputs.ghcr_current }} |"
+            echo "| Versions to Build | ${{ steps.determine-versions.outputs.versions || 'None' }} |"
+            echo "| Should Build | ${{ steps.determine-versions.outputs.should_build }} |"
+            echo "| Eligible for Stable | ${{ steps.check-stable.outputs.should_mark_stable }} |"
+            echo "| Base Image Updated | ${{ steps.check-base-image.outputs.updated }} |"
+            echo "| Platforms | ${{ steps.set-platforms.outputs.platforms }} |"
+            echo "| Compression | ${{ needs.resolve-profile.outputs.compression_type }} level ${{ needs.resolve-profile.outputs.compression_level }} |"
+            echo "| Build Profile | ${{ github.event.inputs.build_profile || 'production' }} |"
+            echo "| Custom Tag | ${{ github.event.inputs.custom_tag || '(auto-generated)' }} |"
+            echo "| Compression Level | ${{ github.event.inputs.compression_level || '22' }} |"
+            echo "| Tag as Latest | ${{ github.event.inputs.tag_as_latest || 'true' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================================
+  # Job 2 — Build per platform
+  # Mirrors optimize_builder() + start-docker-build() + execute_with_retry()
+  # ============================================================================
+  build-platform:
+    name: Build ${{ matrix.version }} (${{ matrix.platform_slug }})
+    runs-on: ubuntu-latest
+    needs: check-releases
+    if: needs.check-releases.outputs.should_build == 'true' && needs.check-releases.outputs.build_matrix != '[]' && needs.check-releases.outputs.build_matrix != ''
+
+    permissions:
+      contents: read
+      packages: write
+
+    # One build per version+platform — no duplicate concurrent builds
+    concurrency:
+      group: build-${{ matrix.version }}-${{ matrix.platform_slug }}
+      cancel-in-progress: false
+
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include: ${{ fromJson(needs.check-releases.outputs.build_matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Clone upstream source at the pinned SHA ────────────────────────────
+      # UPSTREAM_REPO_SHA is tracked by Renovate — Merging a Renovate PR
+      # updates this SHA and triggers a fresh build of the new upstream commit.
+      - name: Clone upstream source
+        run: |
+          git clone https://github.com/FreePeak/db-mcp-server.git upstream
+          cd upstream
+          git checkout ${{ env.UPSTREAM_REPO_SHA }}
+          echo "✅ Checked out upstream @ ${{ env.UPSTREAM_REPO_SHA }}"
+          echo "upstream_sha=${{ env.UPSTREAM_REPO_SHA }}" >> "$GITHUB_OUTPUT"
+        id: upstream
+
+      # ── Free runner disk space (mirrors docker-build.yml) ─────────────────
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h
+
+      # ── Detect system resources (mirrors detect_system_resources) ──────────
+      - name: Detect system resources
+        id: resources
+        run: |
+          CPU=$(nproc)
+          MEM_GB=$(awk '/MemTotal/{print int($2/1024/1024)}' /proc/meminfo)
+          RL=${{ needs.check-releases.outputs.resource_limit_pct }}
+
+          OPT_CPU=$(( CPU * RL / 100 )); [[ $OPT_CPU -lt 1 ]] && OPT_CPU=1
+          OPT_MEM=$(( MEM_GB * RL / 100 )); [[ $OPT_MEM -lt 1 ]] && OPT_MEM=1
+          OPT_W=$OPT_CPU
+
+          echo "opt_cpu=$OPT_CPU"     >> "$GITHUB_OUTPUT"
+          echo "opt_mem=${OPT_MEM}GB" >> "$GITHUB_OUTPUT"
+          echo "opt_workers=$OPT_W"   >> "$GITHUB_OUTPUT"
+          echo "System: ${CPU}c / ${MEM_GB}GB → using ${OPT_CPU}c / ${OPT_MEM}GB @ ${RL}%"
+
+      # ── QEMU only for cross-platform builds (saves time on amd64) ──────────
+      - name: Set up QEMU
+        if: matrix.platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: ${{ matrix.platform }}
+
+      # ── Optimized Buildx builder (mirrors optimize_builder) ────────────────
+      - name: Set up optimized Buildx builder
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=${{ env.BUILDKIT_STEP_LOG_MAX_SIZE }}
+            env.BUILDKIT_STEP_LOG_MAX_SPEED=${{ env.BUILDKIT_STEP_LOG_MAX_SPEED }}
+            env.BUILDKIT_HTTP_TIMEOUT=${{ env.BUILDKIT_HTTP_TIMEOUT }}
+            env.BUILDKIT_REGISTRY_RETRY_COUNT=${{ env.BUILDKIT_REGISTRY_RETRY_COUNT }}
+            env.BUILDKIT_STEP_MEMORY_LIMIT=${{ steps.resources.outputs.opt_mem }}
+            env.BUILDKIT_WORKERS_MAX=${{ steps.resources.outputs.opt_workers }}
+            env.BUILDKIT_GC_KEEP_STORAGE=${{ needs.check-releases.outputs.gc_keep_storage }}
+            env.BUILDKIT_GC_KEEP_DURATION=${{ env.BUILDKIT_GC_KEEP_DURATION }}
+            env.BUILDKIT_INLINE_CACHE=1
+            env.BUILDKIT_CACHE_MOUNT_NS=buildkit
+            env.BUILDKIT_CACHE_SHARE_MODE=shared
+          buildkitd-flags: --debug --allow-insecure-entitlement network.host
+          # Inline GC + registry mirror config (from docker-build.yml buildkitd-config-inline)
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 4
+              gc = true
+              gckeepstorage = 20000000000
+              [[worker.oci.gcpolicy]]
+                keepBytes = 20000000000
+                keepDuration = 604800
+                filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
+              [[worker.oci.gcpolicy]]
+                all = true
+                keepBytes = 50000000000
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      # ── Login ──────────────────────────────────────────────────────────────
+      - name: Login to registries
+        if: github.event_name != 'pull_request'
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+          push_to_dockerhub:  ${{ github.event.inputs.push_to_dockerhub || 'true' }}
+          push_to_ghcr:       ${{ github.event.inputs.push_to_ghcr || 'true' }}
+
+      # ── Cache warming (mirrors warm_build_cache) ───────────────────────────
+      - name: Warm build cache
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: |
+          for img in golang:1.24-alpine alpine:latest debian:bookworm-slim; do
+            docker pull "$img" &>/dev/null && echo "✅ $img" || echo "⚠️  $img (skip)"
+          done
+
+      # ── Compute primary tag ────────────────────────────────────────────────
+      # Uses custom_tag if provided, otherwise auto-generates YYYYMMDD-<sha>
+      - name: Compute build tag
+        id: build-tag
+        run: |
+          DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          AUTO_TAG="${DATE}-${SHORT_SHA}"
+
+          CUSTOM="${{ github.event.inputs.custom_tag }}"
+          if [[ -n "$CUSTOM" ]]; then
+            PRIMARY="$CUSTOM"
+            echo "🏷️  Using custom tag: $PRIMARY"
+          else
+            PRIMARY="$AUTO_TAG"
+            echo "🏷️  Using auto-generated tag: $PRIMARY"
+          fi
+
+          echo "primary=$PRIMARY"     >> "$GITHUB_OUTPUT"
+          echo "auto_tag=$AUTO_TAG"   >> "$GITHUB_OUTPUT"
+          echo "date=$DATE"           >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "is_custom=$([[ -n "$CUSTOM" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # ── Docker metadata ────────────────────────────────────────────────────
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_REPO }}
+            ${{ env.GHCR_REPO }}
+          tags: |
+            # Primary tag: custom if set, otherwise YYYYMMDD-<short-sha>
+            type=raw,value=${{ steps.build-tag.outputs.primary }}
+            # Auto-generated tag always applied (even when custom_tag is set)
+            type=raw,value=${{ steps.build-tag.outputs.auto_tag }},enable=${{ steps.build-tag.outputs.is_custom == 'false' }}
+            # Floating date-only tag: YYYYMMDD
+            type=raw,value=${{ steps.build-tag.outputs.date }}
+            # Floating :latest — controlled by tag_as_latest checkbox
+            type=raw,value=latest,enable=${{ github.event.inputs.tag_as_latest != 'false' && github.ref == 'refs/heads/main' }}
+          labels: |
+            org.opencontainers.image.title=db-mcp-server
+            org.opencontainers.image.description=Multi-database MCP server for AI assistants
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ steps.build-tag.outputs.primary }}
+            org.opencontainers.image.version.auto=${{ steps.build-tag.outputs.auto_tag }}
+            org.opencontainers.image.created=${{ steps.build-tag.outputs.date }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.upstream.repo=https://github.com/FreePeak/db-mcp-server
+            org.opencontainers.image.upstream.revision=${{ env.UPSTREAM_REPO_SHA }}
+            org.opencontainers.image.documentation=https://github.com/FreePeak/db-mcp-server
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # ── Get base image digest for change-tracking label ───────────────────
+      - name: Get base image digest
+        id: base-digest
+        run: |
+          BASE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
+          DIG=$(skopeo inspect "docker://${BASE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
+          echo "digest=$DIG"   >> "$GITHUB_OUTPUT"
+          echo "image=$BASE"   >> "$GITHUB_OUTPUT"
+          echo "Base: $BASE @ $DIG"
+
+      # ── Platform-scoped cache ref ──────────────────────────────────────────
+      - name: Determine cache ref
+        id: cache-ref
+        run: |
+          case "${{ matrix.platform }}" in
+            linux/amd64)   TAG=buildcache-amd64  ;;
+            linux/arm64)   TAG=buildcache-arm64  ;;
+            linux/arm/v7)  TAG=buildcache-armv7  ;;
+            *)             TAG=buildcache-${{ matrix.platform_slug }} ;;
+          esac
+          echo "cache_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # ── Build start monitoring ─────────────────────────────────────────────
+      - name: Start build monitoring
+        id: monitor
+        run: |
+          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "Build started at $(date -u)"
+          echo "Profile:     ${{ github.event.inputs.build_profile || 'production' }}"
+          echo "Compression: ${{ needs.check-releases.outputs.compression_params }}"
+          echo "Platform:    ${{ matrix.platform }}"
+          echo "Version:     ${{ matrix.version }}"
+          echo "Timeout:     ${{ needs.check-releases.outputs.build_timeout_min }}min"
+
+      # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        timeout-minutes: ${{ fromJSON(needs.check-releases.outputs.build_timeout_min) }}
+        with:
+          context: ./upstream
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Pull latest base layer on every build (security + freshness)
+          pull: true
+          # Full provenance + SBOM for supply-chain transparency
+          provenance: mode=max
+          sbom: true
+          # Allow network during build (needed for binary downloads)
+          allow: network.host
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            BUILDKIT_MULTI_PLATFORM=1
+            BUILDKIT_MAX_PARALLELISM=${{ steps.resources.outputs.opt_cpu }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+            BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
+          # Two-tier cache: GHCR registry cache + GHA cache
+          cache-from: |
+            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }}
+            type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
+          cache-to: |
+            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
+            type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
+          # Push by digest — tags applied in merge-manifest job
+          outputs: >-
+            ${{
+              github.event_name == 'pull_request'
+              && 'type=cacheonly'
+              || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
+                   env.DOCKERHUB_REPO,
+                   needs.check-releases.outputs.compression_params,
+                   env.EXPORT_CACHE_CONCURRENCY,
+                   env.EXPORT_LAYERS_CONCURRENCY)
+            }}
+
+      # ── Build end monitoring + summary ────────────────────────────────────
+      - name: Build performance summary
+        if: always()
+        run: |
+          START=${{ steps.monitor.outputs.start_epoch }}
+          DURATION=$(( $(date +%s) - START ))
+          HH=$((DURATION/3600)); MM=$(( (DURATION%3600)/60 )); SS=$((DURATION%60))
+
+          echo "📊 ======== BUILD SUMMARY ========"
+          echo "🏷️  Version:    ${{ matrix.version }}"
+          echo "🖥️  Platform:   ${{ matrix.platform }}"
+          echo "⏱️  Duration:   ${HH}h ${MM}m ${SS}s"
+          echo "🗜️  Compression: ${{ needs.check-releases.outputs.compression_params }}"
+          echo "💻 Resources:  ${{ steps.resources.outputs.opt_cpu }}c / ${{ steps.resources.outputs.opt_mem }}"
+          echo "================================="
+
+          {
+            echo "## 🔧 Platform Build: ${{ steps.build-tag.outputs.primary }} (${{ matrix.platform }})"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Primary Tag | \`${{ steps.build-tag.outputs.primary }}\` |"
+            echo "| Date | ${{ steps.build-tag.outputs.date }} |"
+            echo "| Short SHA | ${{ steps.build-tag.outputs.short_sha }} |"
+            echo "| Platform | ${{ matrix.platform }} |"
+            echo "| Duration | ${HH}h ${MM}m ${SS}s |"
+            echo "| Digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| Image ID | ${{ steps.build.outputs.imageid }} |"
+            echo "| Base Image | ${{ steps.base-digest.outputs.image }} |"
+            echo "| Compression | ${{ needs.check-releases.outputs.compression_params }} |"
+            echo "| CPU/RAM | ${{ steps.resources.outputs.opt_cpu }} / ${{ steps.resources.outputs.opt_mem }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── Save digest ────────────────────────────────────────────────────────
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.version }}-${{ matrix.platform_slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ============================================================================
+  # Job 3 — Merge per-platform digests into multi-arch manifests, per version
+  # ============================================================================
+  merge-manifest:
+    name: Merge Manifest ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs: [check-releases, build-platform]
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.check-releases.outputs.versions_json) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to registries
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+          push_to_dockerhub:  ${{ github.event.inputs.push_to_dockerhub || 'true' }}
+          push_to_ghcr:       ${{ github.event.inputs.push_to_ghcr || 'true' }}
+
+      - name: Download all platform digests for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.version }}-*
+          merge-multiple: true
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          AUTO_TAG="${DATE}-${SHORT_SHA}"
+
+          # custom_tag replaces the primary — auto tag still applied alongside it
+          CUSTOM="${{ github.event.inputs.custom_tag }}"
+          if [[ -n "$CUSTOM" ]]; then
+            PRIMARY="$CUSTOM"
+            echo "🏷️  Custom tag: $PRIMARY (auto: $AUTO_TAG also applied)"
+          else
+            PRIMARY="$AUTO_TAG"
+            echo "🏷️  Auto tag: $PRIMARY"
+          fi
+
+          TAG_AS_LATEST="${{ github.event.inputs.tag_as_latest || 'true' }}"
+
+          # Always apply: primary + date-only
+          DH_TAGS="-t ${{ env.DOCKERHUB_REPO }}:${PRIMARY} -t ${{ env.DOCKERHUB_REPO }}:${DATE}"
+          GC_TAGS="-t ${{ env.GHCR_REPO }}:${PRIMARY}      -t ${{ env.GHCR_REPO }}:${DATE}"
+
+          # When custom tag is set, also apply the auto-generated tag so SHA traceability is preserved
+          if [[ -n "$CUSTOM" ]]; then
+            DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:${AUTO_TAG}"
+            GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:${AUTO_TAG}"
+          fi
+
+          # :latest — checkbox controls this
+          if [[ "$TAG_AS_LATEST" == "true" ]]; then
+            DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:latest"
+            GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:latest"
+          fi
+
+          echo "dockerhub_tags=$DH_TAGS" >> "$GITHUB_OUTPUT"
+          echo "ghcr_tags=$GC_TAGS"      >> "$GITHUB_OUTPUT"
+          echo "primary_tag=$PRIMARY"    >> "$GITHUB_OUTPUT"
+          echo "auto_tag=$AUTO_TAG"      >> "$GITHUB_OUTPUT"
+          echo "date_tag=$DATE"          >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA"    >> "$GITHUB_OUTPUT"
+          echo "DH: $DH_TAGS"
+          echo "GC: $GC_TAGS"
+
+      # ── Docker Hub manifest (with retry — mirrors merge job in docker-build.yml) ──
+      - name: Create Docker Hub multi-arch manifest
+        if: github.event.inputs.push_to_dockerhub != 'false'
+        run: |
+          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.DOCKERHUB_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt/3..."
+            docker buildx imagetools create ${{ steps.tags.outputs.dockerhub_tags }} $SOURCES && break
+            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 10))s..."; sleep $((attempt * 10)); } || exit 1
+          done
+
+      # ── GHCR manifest (with retry) ─────────────────────────────────────────
+      - name: Create GHCR multi-arch manifest
+        if: github.event.inputs.push_to_ghcr != 'false'
+        run: |
+          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.DOCKERHUB_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          for attempt in 1 2 3; do
+            echo "Attempt $attempt/3..."
+            docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES && break
+            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 15))s..."; sleep $((attempt * 15)); } || exit 1
+          done
+
+      - name: Inspect final manifest
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}
+
+      # ── Trivy security scan (non-blocking) ────────────────────────────────
+      - name: Trivy vulnerability scan
+        if: github.event.inputs.run_security_scan != 'false'
+        uses: aquasecurity/trivy-action@0.34.1
+        with:
+          image-ref: '${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}'
+          format: sarif
+          output: 'trivy-${{ matrix.version }}.sarif'
+          severity: 'CRITICAL,HIGH'
+          timeout: '10m'
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF results
+        if: github.event.inputs.run_security_scan != 'false'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: 'trivy-${{ matrix.version }}.sarif'
+          category:   'trivy-${{ steps.tags.outputs.primary_tag }}'
+        continue-on-error: true
+
+      - name: Merge summary
+        run: |
+          {
+            echo "## ✅ Build Complete: ${{ steps.tags.outputs.primary_tag }}"
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Primary Tag | \`${{ steps.tags.outputs.primary_tag }}\` |"
+            echo "| Date Tag | ${{ steps.tags.outputs.date_tag }} |"
+            echo "| Short SHA | ${{ steps.tags.outputs.short_sha }} |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Compression | ${{ needs.check-releases.outputs.compression_params }} |"
+            echo "| Platforms | ${{ needs.check-releases.outputs.platforms }} |"
+            echo ""
+            echo "### Tags Applied"
+            echo '```'
+            echo "${{ steps.tags.outputs.dockerhub_tags }} ${{ steps.tags.outputs.ghcr_tags }}" \
+              | tr ' ' '\n' | grep -v '^-t$' | grep -v '^$'
+            echo '```'
+            echo ""
+            echo "### Platform Digests"
+            for f in /tmp/digests/*; do echo "- \`sha256:$(basename $f)\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info-${{ matrix.version }}
+          path: trivy-${{ matrix.version }}.sarif
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ============================================================================
+  # Job 4 — Registry sync (bidirectional DH ↔ GHCR via skopeo)
+  # ============================================================================
+  sync-registries:
+    name: Sync Registries
+    runs-on: ubuntu-latest
+    needs: [check-releases, merge-manifest]
+    if: |
+      always() &&
+      (needs.check-releases.outputs.action_type == 'sync-registries' ||
+       (needs.check-releases.outputs.action_type == 'auto-check' && needs.merge-manifest.result == 'success'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install skopeo
+        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+
+      - name: Login to registries
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync images
+        uses: ./.github/actions/registry-sync
+        with:
+          dockerhub_repo: ${{ env.DOCKERHUB_REPO }}
+          ghcr_repo:      ${{ env.GHCR_REPO }}
+          tags: latest,stable,${{ needs.check-releases.outputs.versions_to_build }}
+
+  # ============================================================================
+  # Job 5 — Image promotion (version → latest/stable)
+  # ============================================================================
+  promote-image:
+    name: Promote Image
+    runs-on: ubuntu-latest
+    needs: check-releases
+    if: needs.check-releases.outputs.action_type == 'promote-image'
+
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ -z "${{ github.event.inputs.promote_version }}" ]] \
+            && { echo "::error::promote_version is required"; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install skopeo
+        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+
+      - name: Login to registries
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote image
+        run: |
+          SRC="${{ github.event.inputs.promote_version }}"
+          TGT="${{ github.event.inputs.promote_tag }}"
+
+          skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${SRC}" > /dev/null 2>&1 \
+            || { echo "::error::Source $SRC not found in Docker Hub"; exit 1; }
+
+          echo "Promoting $SRC → $TGT on Docker Hub..."
+          skopeo copy --all "docker://${{ env.DOCKERHUB_REPO }}:${SRC}" "docker://${{ env.DOCKERHUB_REPO }}:${TGT}"
+
+          echo "Promoting $SRC → $TGT on GHCR..."
+          skopeo copy --all "docker://${{ env.GHCR_REPO }}:${SRC}" "docker://${{ env.GHCR_REPO }}:${TGT}"
+
+          {
+            echo "## Image Promotion"
+            echo "| Source | Target | Status |"
+            echo "|---|---|---|"
+            echo "| $SRC | $TGT | ✅ Success |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================================
+  # Job 6 — Mark stable (5-day rule with digest deduplication)
+  # ============================================================================
+  mark-stable:
+    name: Mark Stable
+    runs-on: ubuntu-latest
+    needs: [check-releases, merge-manifest, sync-registries]
+    if: |
+      always() &&
+      (needs.check-releases.outputs.action_type == 'mark-stable' ||
+       (needs.check-releases.outputs.action_type == 'auto-check' &&
+        needs.check-releases.outputs.should_mark_stable == 'true'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install skopeo
+        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+
+      - name: Login to registries
+        uses: ./.github/actions/registry-login
+        with:
+          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
+          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check and promote to stable
+        run: |
+          STABLE_VERSION="${{ needs.check-releases.outputs.stable_version }}"
+          [[ -z "$STABLE_VERSION" ]] && { echo "No version eligible for stable"; exit 0; }
+
+          # Skip if :stable already points to this version
+          CURRENT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/dev/null \
+            | jq -r '.Digest' || echo "none")
+          TARGET=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" 2>/dev/null \
+            | jq -r '.Digest' || echo "none")
+
+          if [[ "$CURRENT" == "$TARGET" && "$CURRENT" != "none" ]]; then
+            echo "✅ :stable already points to $STABLE_VERSION — nothing to do"
+            exit 0
+          fi
+
+          echo "Marking $STABLE_VERSION as :stable..."
+          skopeo copy --all "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" "docker://${{ env.DOCKERHUB_REPO }}:stable"
+          skopeo copy --all "docker://${{ env.GHCR_REPO }}:${STABLE_VERSION}"      "docker://${{ env.GHCR_REPO }}:stable"
+
+          {
+            echo "## Stable Promotion"
+            echo "Version **$STABLE_VERSION** → **:stable**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================================
+  # Job 7 — Cache housekeeping (mirrors optimize-cache / clean-cache)
+  # ============================================================================
+  cache-cleanup:
+    name: Cache Housekeeping
+    runs-on: ubuntu-latest
+    needs: [check-releases, merge-manifest]
+    if: github.event_name != 'pull_request' && needs.merge-manifest.result == 'success'
+
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prune stale build cache
+        run: |
+          docker buildx prune \
+            --filter "until=168h" \
+            --keep-storage "${{ needs.check-releases.outputs.gc_keep_storage }}" \
+            -f
+          echo "✅ Cache pruned (7-day retention / ${{ needs.check-releases.outputs.gc_keep_storage }} max)"
+
+  # ============================================================================
+  # Job 8 — Update Docker Hub description (release tags only)
+  # ============================================================================
+  update-description:
+    name: Update Docker Hub Description
+    runs-on: ubuntu-latest
+    needs: merge-manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync README → Docker Hub
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_REPO }}
+          readme-filepath: ./README.md
+          short-description: "Multi-database MCP server — MySQL, PostgreSQL, SQLite, Oracle, TimescaleDB"
