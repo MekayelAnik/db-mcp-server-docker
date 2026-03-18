@@ -1244,9 +1244,7 @@ jobs:
     needs: [check-releases, merge-manifest, sync-registries]
     if: |
       always() &&
-      (needs.check-releases.outputs.action_type == 'mark-stable' ||
-       (needs.check-releases.outputs.action_type == 'auto-check' &&
-        needs.check-releases.outputs.should_mark_stable == 'true'))
+      needs.check-releases.outputs.action_type == 'mark-stable'
 
     steps:
       - name: Checkout
