@@ -4,6 +4,8 @@ set -euo pipefail
 readonly DEFAULT_PORT=9092
 readonly DEFAULT_INTERNAL_PORT=38011
 readonly DEFAULT_PROTOCOL="sse"
+readonly DEFAULT_TLS_DAYS=365
+readonly DEFAULT_TLS_CN="localhost"
 readonly SAFE_API_KEY_REGEX='^[A-Za-z0-9_:.@+=-]{5,128}$'
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
@@ -17,6 +19,13 @@ trim() {
 
 is_positive_int() {
   [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
+}
+
+is_true() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 validate_port() {
@@ -43,12 +52,90 @@ validate_api_key() {
   fi
 
   if [[ ! "$API_KEY" =~ $SAFE_API_KEY_REGEX ]]; then
-    echo "Invalid API_KEY format. Disabling API key auth."
-    export API_KEY=""
-    return
+    echo "Invalid API_KEY format. Refusing to start with malformed API key." >&2
+    return 1
   fi
 
   export API_KEY
+}
+
+validate_tls_days() {
+  local value="$1"
+  local fallback="$2"
+
+  if ! is_positive_int "$value"; then
+    echo "Invalid TLS_DAYS='$value', using default ${fallback}"
+    printf '%s' "$fallback"
+    return
+  fi
+
+  printf '%s' "$value"
+}
+
+ensure_parent_dir() {
+  local target="$1"
+  mkdir -p "$(dirname "$target")"
+}
+
+prepare_tls_pem() {
+  local cert_path="$1"
+  local key_path="$2"
+  local pem_path="$3"
+  local tls_days="$4"
+  local tls_cn="$5"
+  local tls_san="$6"
+
+  if [[ -f "$pem_path" ]]; then
+    return
+  fi
+
+  ensure_parent_dir "$pem_path"
+
+  if [[ -f "$cert_path" && -f "$key_path" ]]; then
+    cat "$cert_path" "$key_path" > "$pem_path"
+    chmod 600 "$pem_path"
+    return
+  fi
+
+  echo "TLS enabled and no certificate material found; generating self-signed certificate (CN=${tls_cn})"
+  ensure_parent_dir "$cert_path"
+  ensure_parent_dir "$key_path"
+
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$key_path" \
+    -out "$cert_path" \
+    -days "$tls_days" \
+    -subj "/CN=${tls_cn}" \
+    -addext "subjectAltName=${tls_san}" >/dev/null 2>&1
+
+  chmod 600 "$cert_path" "$key_path"
+  cat "$cert_path" "$key_path" > "$pem_path"
+  chmod 600 "$pem_path"
+}
+
+escape_sed_replacement() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//&/\\&}"
+  value="${value//|/\\|}"
+  printf '%s' "$value"
+}
+
+escape_haproxy_regex() {
+  local value="$1"
+  local escaped=""
+  local i ch
+
+  for ((i = 0; i < ${#value}; i++)); do
+    ch="${value:i:1}"
+    if [[ "$ch" =~ [\\.^$\|?*+(){}\[\]] ]]; then
+      escaped+="\\$ch"
+    else
+      escaped+="$ch"
+    fi
+  done
+
+  printf '%s' "$escaped"
 }
 
 generate_haproxy_config() {
@@ -59,13 +146,12 @@ generate_haproxy_config() {
 
   local api_key_check
   if [[ -n "$API_KEY" ]]; then
-    local escaped_key="$API_KEY"
-    escaped_key="${escaped_key//\\/\\\\}"
-    escaped_key="${escaped_key//\"/\\\"}"
+    local escaped_key_regex
+    escaped_key_regex="$(escape_haproxy_regex "$API_KEY")"
 
     api_key_check="    # API Key authentication enabled (localhost /healthz excluded)
     acl auth_header_present var(txn.auth_header) -m found
-    acl auth_valid var(txn.auth_header) -m str \"Bearer ${escaped_key}\"
+    acl auth_valid var(txn.auth_header) -m reg ^[Bb][Ee][Aa][Rr][Ee][Rr][[:space:]]+${escaped_key_regex}$
 
     # Deny requests without valid authentication (except localhost health checks)
     http-request deny deny_status 401 content-type \"application/json\" string '{\"error\":\"Unauthorized\",\"message\":\"Valid API key required\"}' if !is_health_check !auth_header_present
@@ -76,7 +162,10 @@ generate_haproxy_config() {
     api_key_check="    # API Key authentication disabled - all requests allowed"
   fi
 
-  sed -e "s|__PORT__|${SERVER_PORT}|g" \
+  local escaped_bind_directive
+  escaped_bind_directive="$(escape_sed_replacement "${BIND_DIRECTIVE}")"
+
+  sed -e "s|__BIND_DIRECTIVE__|${escaped_bind_directive}|g" \
       -e "s|__INTERNAL_PORT__|${INTERNAL_SERVER_PORT}|g" \
       -e "s|__SERVER_NAME__|dbmcp|g" \
       -e "s|__CORS_PREFLIGHT_CONDITION__|{ always_false }|g" \
@@ -148,11 +237,27 @@ main() {
 
   SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
   INTERNAL_SERVER_PORT="${INTERNAL_SERVER_PORT:-$DEFAULT_INTERNAL_PORT}"
+  ENABLE_HTTPS="${ENABLE_HTTPS:-false}"
+  TLS_CERT_PATH="${TLS_CERT_PATH:-/etc/haproxy/certs/server.crt}"
+  TLS_KEY_PATH="${TLS_KEY_PATH:-/etc/haproxy/certs/server.key}"
+  TLS_PEM_PATH="${TLS_PEM_PATH:-/etc/haproxy/certs/server.pem}"
+  TLS_CN="${TLS_CN:-$DEFAULT_TLS_CN}"
+  TLS_SAN="${TLS_SAN:-DNS:${TLS_CN}}"
+  TLS_DAYS="${TLS_DAYS:-$DEFAULT_TLS_DAYS}"
 
   SERVER_PORT="$(validate_port "SERVER_PORT" "$SERVER_PORT" "$DEFAULT_PORT")"
   INTERNAL_SERVER_PORT="$(validate_port "INTERNAL_SERVER_PORT" "$INTERNAL_SERVER_PORT" "$DEFAULT_INTERNAL_PORT")"
+  TLS_DAYS="$(validate_tls_days "$TLS_DAYS" "$DEFAULT_TLS_DAYS")"
 
   validate_api_key
+
+  if is_true "$ENABLE_HTTPS"; then
+    prepare_tls_pem "$TLS_CERT_PATH" "$TLS_KEY_PATH" "$TLS_PEM_PATH" "$TLS_DAYS" "$TLS_CN" "$TLS_SAN"
+    BIND_DIRECTIVE="bind *:${SERVER_PORT} ssl crt ${TLS_PEM_PATH}"
+  else
+    BIND_DIRECTIVE="bind *:${SERVER_PORT}"
+  fi
+
   generate_haproxy_config
   start_server
   start_haproxy
@@ -161,6 +266,12 @@ main() {
     echo "API key authentication enabled"
   else
     echo "API key authentication disabled"
+  fi
+
+  if is_true "$ENABLE_HTTPS"; then
+    echo "HTTPS enabled on port ${SERVER_PORT}"
+  else
+    echo "HTTPS disabled; serving HTTP on port ${SERVER_PORT}"
   fi
 
   trap shutdown SIGINT SIGTERM EXIT

@@ -49,6 +49,7 @@ RUN apk add --no-cache \
     tzdata \
     bash \
     haproxy \
+  openssl \
     netcat-openbsd \
     bind-tools \
     iputils \
@@ -69,6 +70,13 @@ ENV INTERNAL_SERVER_PORT=38011
 ENV TRANSPORT_MODE=sse
 ENV CONFIG_PATH=/app/config.json
 ENV API_KEY=
+ENV ENABLE_HTTPS=false
+ENV TLS_CERT_PATH=/etc/haproxy/certs/server.crt
+ENV TLS_KEY_PATH=/etc/haproxy/certs/server.key
+ENV TLS_PEM_PATH=/etc/haproxy/certs/server.pem
+ENV TLS_CN=localhost
+ENV TLS_SAN=DNS:localhost
+ENV TLS_DAYS=365
 
 EXPOSE 9092
 VOLUME ["/app/logs"]
