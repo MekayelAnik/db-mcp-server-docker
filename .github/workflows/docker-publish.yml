@@ -1042,7 +1042,11 @@ jobs:
         id: dockerhub-manifest
         if: github.event.inputs.push_to_dockerhub != 'false'
         run: |
-          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.DOCKERHUB_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          SOURCE_REPO="${{ env.GHCR_REPO }}"
+          if [[ "${{ github.event.inputs.push_to_ghcr || 'true' }}" != "true" ]]; then
+            SOURCE_REPO="${{ env.DOCKERHUB_REPO }}"
+          fi
+          SOURCES=$(for f in /tmp/digests/*; do echo "${SOURCE_REPO}@sha256:$(basename $f)"; done | tr '\n' ' ')
           SUCCESS=0
           RATE_LIMITED=0
 
@@ -1076,7 +1080,7 @@ jobs:
       - name: Create GHCR multi-arch manifest
         if: github.event.inputs.push_to_ghcr != 'false'
         run: |
-          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.DOCKERHUB_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
             docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES && break
