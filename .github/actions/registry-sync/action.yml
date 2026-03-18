@@ -2,14 +2,14 @@
 # Composite Action: Registry Sync
 # Path: .github/actions/registry-sync/action.yml
 # =============================================================================
-# Reusable action for syncing images between Docker Hub and GHCR.
+# Reusable action for syncing images from GHCR (primary) to Docker Hub (secondary).
 # Uses skopeo for manifest-preserving multi-arch copies.
 #
-# Sync logic:
-#   • Tag in DH only  → copy DH → GHCR
-#   • Tag in GHCR only → copy GHCR → DH
-#   • Tag in both     → skip (already in sync)
-#   • Tag in neither  → skip (not yet built)
+# Sync logic (GHCR primary):
+#   • Tag in GHCR only  → copy GHCR → DH
+#   • Tag in both       → if digest mismatch, copy GHCR → DH
+#   • Tag in DH only    → fail (primary missing)
+#   • Tag in neither    → skip (not yet built)
 #
 # Usage:
 #   - name: Sync images
@@ -25,7 +25,7 @@
 # =============================================================================
 
 name: 'Registry Sync'
-description: 'Bidirectional sync of Docker images between Docker Hub and GHCR using skopeo'
+description: 'One-way sync of Docker images from GHCR (primary) to Docker Hub (secondary) using skopeo'
 
 inputs:
   dockerhub_repo:
@@ -111,15 +111,7 @@ runs:
           GC_EXISTS=$(skopeo inspect "docker://${gc_ref}" &>/dev/null && echo yes || echo no)
           echo "  Docker Hub: $DH_EXISTS | GHCR: $GC_EXISTS"
 
-          if [[ "$DH_EXISTS" == yes && "$GC_EXISTS" == no ]]; then
-            echo "  → Syncing Docker Hub → GHCR"
-            if skopeo_copy_with_retry "$tag: DH→GHCR" "$dh_ref" "$gc_ref"; then
-              SYNCED_TAGS="$SYNCED_TAGS $tag(DH→GHCR)"
-            else
-              FAILED_TAGS="$FAILED_TAGS $tag"
-            fi
-
-          elif [[ "$DH_EXISTS" == no && "$GC_EXISTS" == yes ]]; then
+          if [[ "$DH_EXISTS" == no && "$GC_EXISTS" == yes ]]; then
             echo "  → Syncing GHCR → Docker Hub"
             if skopeo_copy_with_retry "$tag: GHCR→DH" "$gc_ref" "$dh_ref"; then
               SYNCED_TAGS="$SYNCED_TAGS $tag(GHCR→DH)"
@@ -133,22 +125,20 @@ runs:
             GC_DIG=$(skopeo inspect --raw "docker://${gc_ref}" 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "")
 
             if [[ -n "$DH_DIG" && -n "$GC_DIG" && "$DH_DIG" != "$GC_DIG" ]]; then
-              # Prefer GHCR as source to avoid Docker Hub pull-rate limits.
-              echo "  → Digest mismatch — re-syncing GHCR → Docker Hub (preferred)"
+              echo "  → Digest mismatch — re-syncing GHCR → Docker Hub"
               if skopeo_copy_with_retry "$tag: GHCR→DH (re-sync)" "$gc_ref" "$dh_ref"; then
                 SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync GHCR→DH)"
               else
-                echo "  → Fallback: re-syncing Docker Hub → GHCR"
-                if skopeo_copy_with_retry "$tag: DH→GHCR (re-sync fallback)" "$dh_ref" "$gc_ref"; then
-                  SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync DH→GHCR)"
-                else
-                  FAILED_TAGS="$FAILED_TAGS $tag"
-                fi
+                FAILED_TAGS="$FAILED_TAGS $tag"
               fi
             else
               echo "  ✅ Already in sync — skipping"
               SKIPPED_TAGS="$SKIPPED_TAGS $tag"
             fi
+
+          elif [[ "$DH_EXISTS" == yes && "$GC_EXISTS" == no ]]; then
+            echo "  ❌ GHCR missing while Docker Hub has tag; refusing Docker Hub as source"
+            FAILED_TAGS="$FAILED_TAGS $tag(ghcr-missing)"
 
           else
             echo "  ⚠️  Not found in either registry — skipping"

@@ -887,7 +887,7 @@ jobs:
               github.event_name == 'pull_request'
               && 'type=cacheonly'
               || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
-                   env.DOCKERHUB_REPO,
+                    (github.event.inputs.push_to_ghcr != 'false' && env.GHCR_REPO || env.DOCKERHUB_REPO),
                    needs.check-releases.outputs.compression_params,
                    env.EXPORT_CACHE_CONCURRENCY,
                    env.EXPORT_LAYERS_CONCURRENCY)
