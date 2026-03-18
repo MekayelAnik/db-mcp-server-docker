@@ -24,6 +24,7 @@
   <a href="#docker-cli">Docker CLI</a> •
   <a href="#docker-compose">Docker Compose</a> •
   <a href="#networking">Networking</a> •
+  <a href="#security--transport">Security & Transport</a> •
   <a href="#configuration">Configuration</a> •
   <a href="#supported-databases">Supported Databases</a> •
   <a href="#environment-variables">Environment Variables</a> •
@@ -118,6 +119,8 @@ docker run -d \
 ```
 
 The MCP server is now available at `http://localhost:9092/sse`.
+
+For production or remote access, enable HTTPS and API key auth (see Security & Transport section).
 
 ---
 
@@ -524,6 +527,76 @@ server {
 
 ---
 
+## Security & Transport
+
+### Should HTTPS be default?
+
+Current default is `ENABLE_HTTPS=false` for compatibility with local tooling and existing HTTP-based MCP setups.
+
+Recommended practice:
+- Local-only development: HTTP can be acceptable on trusted localhost-only networks.
+- Any remote/LAN/public use: enable HTTPS and API key auth.
+
+### What transport does this MCP expose?
+
+Application transport modes:
+- `sse` (default) via HTTP(S)
+- `stdio` (for local command-based integrations)
+
+When running in container server mode (`TRANSPORT_MODE=sse`):
+- Public listener: HAProxy on `SERVER_PORT` (default `9092`)
+- Internal app listener: MCP server on `INTERNAL_SERVER_PORT` (default `38011`, local-only in container)
+
+Common MCP HTTP endpoints exposed by upstream server include:
+- `/sse`
+- `/jsonrpc`
+- `/message`
+- `/events`
+- `/status`
+
+### API key authentication behavior
+
+Set `API_KEY` to enable Bearer token protection in HAProxy.
+
+Expected status behavior:
+- Missing auth header -> `401 Unauthorized`
+- Invalid key -> `403 Forbidden`
+- Valid key -> request is forwarded to backend (backend may still return `200`, `204`, `405`, etc., depending on endpoint/method)
+
+Notes:
+- `Bearer` scheme is matched case-insensitively (`Bearer`/`bearer` both work).
+- Invalid API key format is fail-closed: container exits at startup.
+- `/healthz` has a localhost-only bypass for internal health checks.
+
+### HTTPS and certificate behavior
+
+If `ENABLE_HTTPS=true`, HAProxy serves TLS on `SERVER_PORT`.
+
+Certificate precedence:
+1. If `TLS_PEM_PATH` exists, it is used directly.
+2. Else if both `TLS_CERT_PATH` and `TLS_KEY_PATH` exist, they are combined into PEM.
+3. Else a self-signed cert is auto-generated using `TLS_CN` and `TLS_SAN`.
+
+### Secure run example (recommended)
+
+```bash
+docker run -d \
+  --name db-mcp-server \
+  -p 9092:9092 \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -e TRANSPORT_MODE=sse \
+  -e ENABLE_HTTPS=true \
+  -e TLS_CN=localhost \
+  -e TLS_SAN=DNS:localhost,IP:127.0.0.1 \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+Then connect using:
+- `https://localhost:9092/sse`
+
+---
+
 ## Configuration
 
 Create a `config.json` and mount it to `/app/config.json` inside the container.
@@ -593,9 +666,18 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERVER_PORT` | `9092` | Port the server listens on |
+| `SERVER_PORT` | `9092` | Public HAProxy listener port |
+| `INTERNAL_SERVER_PORT` | `38011` | Internal MCP server port (inside container) |
 | `TRANSPORT_MODE` | `sse` | Transport mode: `sse` or `stdio` |
 | `CONFIG_PATH` | `/app/config.json` | Path to the database config file inside the container |
+| `API_KEY` | *(empty)* | Enables Bearer auth when set (validated at startup) |
+| `ENABLE_HTTPS` | `false` | Enables TLS termination in HAProxy |
+| `TLS_CERT_PATH` | `/etc/haproxy/certs/server.crt` | Certificate file path |
+| `TLS_KEY_PATH` | `/etc/haproxy/certs/server.key` | Private key file path |
+| `TLS_PEM_PATH` | `/etc/haproxy/certs/server.pem` | PEM bundle path used by HAProxy |
+| `TLS_CN` | `localhost` | CN used for auto-generated self-signed cert |
+| `TLS_SAN` | `DNS:localhost` | SAN used for auto-generated self-signed cert |
+| `TLS_DAYS` | `365` | Validity period for auto-generated self-signed cert |
 
 ---
 
@@ -607,11 +689,13 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 {
   "mcpServers": {
     "db-mcp-server": {
-      "url": "http://localhost:9092/sse"
+      "url": "https://localhost:9092/sse"
     }
   }
 }
 ```
+
+If HTTPS is disabled, use `http://localhost:9092/sse` instead.
 
 ### Claude Desktop (STDIO mode via Docker)
 
