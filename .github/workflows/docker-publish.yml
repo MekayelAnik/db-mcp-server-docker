@@ -754,28 +754,6 @@ jobs:
           push_to_dockerhub:  ${{ github.event.inputs.push_to_dockerhub || 'true' }}
           push_to_ghcr:       ${{ github.event.inputs.push_to_ghcr || 'true' }}
 
-      - name: Resolve digest push targets
-        id: push-targets
-        run: |
-          PUSH_DH="${{ github.event.inputs.push_to_dockerhub || 'true' }}"
-          PUSH_GHCR="${{ github.event.inputs.push_to_ghcr || 'true' }}"
-
-          TARGETS=""
-          if [[ "$PUSH_DH" == "true" ]]; then
-            TARGETS="${{ env.DOCKERHUB_REPO }}"
-          fi
-          if [[ "$PUSH_GHCR" == "true" ]]; then
-            TARGETS="${TARGETS:+${TARGETS},}${{ env.GHCR_REPO }}"
-          fi
-
-          if [[ -z "$TARGETS" ]]; then
-            echo "❌ At least one registry must be enabled for push"
-            exit 1
-          fi
-
-          echo "names=$TARGETS" >> "$GITHUB_OUTPUT"
-          echo "Digest push targets: $TARGETS"
-
       # ── Cache warming (mirrors warm_build_cache) ───────────────────────────
       - name: Warm build cache
         if: github.event_name != 'pull_request'
@@ -911,7 +889,7 @@ jobs:
               github.event_name == 'pull_request'
               && 'type=cacheonly'
               || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
-                   steps.push-targets.outputs.names,
+                   env.DOCKERHUB_REPO,
                    needs.check-releases.outputs.compression_params,
                    env.EXPORT_CACHE_CONCURRENCY,
                    env.EXPORT_LAYERS_CONCURRENCY)
