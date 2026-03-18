@@ -571,6 +571,7 @@ Notes:
 ### HTTPS and certificate behavior
 
 If `ENABLE_HTTPS=true`, HAProxy serves TLS on `SERVER_PORT`.
+Default minimum TLS version is `TLSv1.3`.
 
 Certificate precedence:
 1. If `TLS_PEM_PATH` exists, it is used directly.
@@ -678,6 +679,7 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 | `TLS_CN` | `localhost` | CN used for auto-generated self-signed cert |
 | `TLS_SAN` | `DNS:localhost` | SAN used for auto-generated self-signed cert |
 | `TLS_DAYS` | `365` | Validity period for auto-generated self-signed cert |
+| `TLS_MIN_VERSION` | `TLSv1.3` | Minimum accepted TLS version for HTTPS listener (`TLSv1.2` or `TLSv1.3`) |
 
 ---
 

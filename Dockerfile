@@ -77,6 +77,7 @@ ENV TLS_PEM_PATH=/etc/haproxy/certs/server.pem
 ENV TLS_CN=localhost
 ENV TLS_SAN=DNS:localhost
 ENV TLS_DAYS=365
+ENV TLS_MIN_VERSION=TLSv1.3
 
 EXPOSE 9092
 VOLUME ["/app/logs"]

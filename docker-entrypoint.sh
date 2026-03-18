@@ -6,6 +6,7 @@ readonly DEFAULT_INTERNAL_PORT=38011
 readonly DEFAULT_PROTOCOL="sse"
 readonly DEFAULT_TLS_DAYS=365
 readonly DEFAULT_TLS_CN="localhost"
+readonly DEFAULT_TLS_MIN_VERSION="TLSv1.3"
 readonly SAFE_API_KEY_REGEX='^[A-Za-z0-9_:.@+=-]{5,128}$'
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
@@ -70,6 +71,21 @@ validate_tls_days() {
   fi
 
   printf '%s' "$value"
+}
+
+validate_tls_min_version() {
+  local value="$1"
+  local fallback="$2"
+
+  case "$value" in
+    TLSv1.2|TLSv1.3)
+      printf '%s' "$value"
+      ;;
+    *)
+      echo "Invalid TLS_MIN_VERSION='$value', using default ${fallback}" >&2
+      printf '%s' "$fallback"
+      ;;
+  esac
 }
 
 ensure_parent_dir() {
@@ -244,16 +260,18 @@ main() {
   TLS_CN="${TLS_CN:-$DEFAULT_TLS_CN}"
   TLS_SAN="${TLS_SAN:-DNS:${TLS_CN}}"
   TLS_DAYS="${TLS_DAYS:-$DEFAULT_TLS_DAYS}"
+  TLS_MIN_VERSION="${TLS_MIN_VERSION:-$DEFAULT_TLS_MIN_VERSION}"
 
   SERVER_PORT="$(validate_port "SERVER_PORT" "$SERVER_PORT" "$DEFAULT_PORT")"
   INTERNAL_SERVER_PORT="$(validate_port "INTERNAL_SERVER_PORT" "$INTERNAL_SERVER_PORT" "$DEFAULT_INTERNAL_PORT")"
   TLS_DAYS="$(validate_tls_days "$TLS_DAYS" "$DEFAULT_TLS_DAYS")"
+  TLS_MIN_VERSION="$(validate_tls_min_version "$TLS_MIN_VERSION" "$DEFAULT_TLS_MIN_VERSION")"
 
   validate_api_key
 
   if is_true "$ENABLE_HTTPS"; then
     prepare_tls_pem "$TLS_CERT_PATH" "$TLS_KEY_PATH" "$TLS_PEM_PATH" "$TLS_DAYS" "$TLS_CN" "$TLS_SAN"
-    BIND_DIRECTIVE="bind *:${SERVER_PORT} ssl crt ${TLS_PEM_PATH}"
+    BIND_DIRECTIVE="bind *:${SERVER_PORT} ssl crt ${TLS_PEM_PATH} ssl-min-ver ${TLS_MIN_VERSION}"
   else
     BIND_DIRECTIVE="bind *:${SERVER_PORT}"
   fi
