@@ -8,7 +8,7 @@
 # =============================================================================
 
 # ── xx cross-compilation helpers ──────────────────────────────────────────────
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.6.1 AS xx
+FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0 AS xx
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
 # Always runs on the native build platform (amd64 in CI), cross-compiles output
