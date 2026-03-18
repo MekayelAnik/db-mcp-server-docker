@@ -81,7 +81,7 @@ on:
         default: latest
 
       force_build:
-        description: 'Force rebuild even if image already exists'
+        description: 'Force rebuild even if image exists in one or both registries'
         required: false
         type: boolean
         default: false
