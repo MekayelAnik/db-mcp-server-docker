@@ -15,7 +15,7 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/mekayelanik/db-mcp-server-docker/docker-publish.yml?branch=main&logo=githubactions&logoColor=white&label=Build)](https://github.com/mekayelanik/db-mcp-server-docker/actions/workflows/docker-publish.yml)
 [![Last Commit](https://img.shields.io/github/last-commit/mekayelanik/db-mcp-server-docker?logo=github&logoColor=white)](https://github.com/mekayelanik/db-mcp-server-docker/commits/main)
 
-<h3>Unofficial multi-arch Docker image for <a href="https://github.com/FreePeak/db-mcp-server">FreePeak/db-mcp-server</a> — a powerful multi-database MCP server for AI assistants.</h3>
+<h3>Unofficial multi-arch Up-to-Date Docker image for <a href="https://github.com/FreePeak/db-mcp-server">FreePeak/db-mcp-server</a> — a powerful multi-database MCP server for AI assistants.</h3>
 
 <div>
   <a href="#credits">Credits</a> •
@@ -40,7 +40,7 @@ This image packages the **[FreePeak/db-mcp-server](https://github.com/FreePeak/d
 
 This repository only provides:
 - A multi-arch Docker image (`linux/amd64`, `linux/arm64`, `linux/arm/v7`)
-- Automated image builds via GitHub Actions
+- GitHub Actions workflow for manual build/publish and promotion operations
 - This Docker-focused usage documentation
 
 For feature requests, bug reports, and source code contributions, please visit the [upstream repository](https://github.com/FreePeak/db-mcp-server).
@@ -49,7 +49,11 @@ For feature requests, bug reports, and source code contributions, please visit t
 
 ## Images
 
-Images are published to both registries on every upstream commit and are identical in content.
+Images are published to both registries via manual workflow dispatch (`Docker Build & Publish`) and are intended to remain identical in content.
+
+Stable promotion is available through workflow actions:
+- `auto-check` promotes to `stable` after 5 days of `latest` age (when eligible)
+- `mark-stable` performs explicit/manual stable promotion
 
 | Registry | Image |
 |---|---|
@@ -60,8 +64,8 @@ Images are published to both registries on every upstream commit and are identic
 
 | Tag | Description |
 |---|---|
-| `latest` | Latest build from upstream `main` |
-| `stable` | Promoted after 5 days of `latest` stability |
+| `latest` | Latest manually published build from upstream `main` |
+| `stable` | Promoted from a published version (auto-eligible after 5 days or manual `mark-stable`) |
 | `YYYYMMDD-<sha>` | Immutable tag — exact upstream commit and build date, e.g. `20250312-19b7975` |
 | `YYYYMMDD` | Floating date tag — latest build of that day |
 
@@ -74,6 +78,16 @@ Images are published to both registries on every upstream commit and are identic
 | `linux/arm/v7` | ARM 32-bit (Raspberry Pi 2/3, older ARM boards) |
 
 ---
+
+## 😎 Buy Me a Coffee ☕︎
+
+**Your support encourages me to keep creating/supporting my open-source projects.** If you found value in this project, you can buy me a coffee to keep me inspired.
+
+<p align="center">
+<a href="https://07mekayel07.gumroad.com/coffee" target="_blank">
+<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
+</a>
+</p>
 
 ## Quick Start
 
@@ -629,7 +643,7 @@ The packaged application — **[FreePeak/db-mcp-server](https://github.com/FreeP
 
 <div align="center">
 
-Built with ❤️ on top of [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-server)
+Built on top of [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-server)
 
 </div>
 
