@@ -10,11 +10,6 @@
 #
 # Triggers
 # ─────────────────────────────────────────────────────────────────────────────
-#   schedule (*/30)   → auto-check: builds only if image is missing
-#   repository_dispatch               → same as schedule (external cron support)
-#   push main         → :latest + :sha-<short>
-#   push vX.Y.Z tag   → :vX.Y.Z + :X.Y + :X + :latest
-#   pull_request      → build-only (no push), validates image
 #   workflow_dispatch → manual with full action + profile selection
 #
 # Required Secrets  (Settings → Secrets → Actions)
@@ -35,25 +30,6 @@
 name: Docker Build & Publish
 
 on:
-  # ── Time-based: check for new upstream releases every 30 minutes ───────────
-  schedule:
-    - cron: '*/30 * * * *'
-
-  # ── External cron (cron-job.org / similar) ──────────────────────────────────
-  repository_dispatch:
-    types: [Docker Build & Publish - Cron Scheduled]
-
-  # ── Code pushes ─────────────────────────────────────────────────────────────
-  push:
-    branches:
-      - main
-    tags:
-      - "v*.*.*"
-
-  pull_request:
-    branches:
-      - main
-
   # ── Manual dispatch ─────────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
@@ -66,7 +42,6 @@ on:
           - build-versions
           - promote-image
           - sync-registries
-          - mark-stable
         default: auto-check
 
       build_profile:
@@ -100,7 +75,6 @@ on:
         type: choice
         options:
           - latest
-          - stable
         default: latest
 
       force_build:
@@ -289,8 +263,6 @@ jobs:
       versions_json:      ${{ steps.determine-versions.outputs.versions_json }}
       should_build:       ${{ steps.determine-versions.outputs.should_build }}
       build_matrix:       ${{ steps.generate-matrix.outputs.matrix }}
-      should_mark_stable: ${{ steps.check-stable.outputs.should_mark_stable }}
-      stable_version:     ${{ steps.check-stable.outputs.stable_version }}
       action_type:        ${{ steps.set-action.outputs.action }}
       platforms:          ${{ steps.set-platforms.outputs.platforms }}
       compression_level:  ${{ needs.resolve-profile.outputs.compression_level }}
@@ -315,15 +287,7 @@ jobs:
       - name: Set action type
         id: set-action
         run: |
-          if [[ "${{ github.event_name }}" == "schedule" || "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            echo "action=auto-check" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            echo "action=auto-check" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "action=auto-check" >> "$GITHUB_OUTPUT"
-          else
-            echo "action=${{ github.event.inputs.action }}" >> "$GITHUB_OUTPUT"
-          fi
+          echo "action=${{ github.event.inputs.action }}" >> "$GITHUB_OUTPUT"
 
       - name: Set platforms
         id: set-platforms
@@ -459,40 +423,6 @@ jobs:
               || echo "updated=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check 5-day stable promotion eligibility
-        id: check-stable
-        run: |
-          # Read current :latest image creation date from GHCR
-          LATEST_CREATED=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
-            | jq -r '.Created' || echo "")
-
-          if [[ -z "$LATEST_CREATED" ]]; then
-            echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
-            echo "stable_version="          >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          LATEST_EPOCH=$(date -d "$LATEST_CREATED" +%s 2>/dev/null || echo "0")
-          NOW=$(date +%s)
-          FIVE_DAYS=$(( 5 * 24 * 3600 ))
-          DAYS_OLD=$(( (NOW - LATEST_EPOCH) / 86400 ))
-
-          # Get the version label from the current latest image
-          LATEST_VERSION=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
-            | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
-
-          echo "Latest image is $DAYS_OLD days old (version: ${LATEST_VERSION:-unknown})"
-
-          if [[ $LATEST_EPOCH -gt 0 && $(( NOW - LATEST_EPOCH )) -ge $FIVE_DAYS ]]; then
-            echo "should_mark_stable=true"         >> "$GITHUB_OUTPUT"
-            echo "stable_version=$LATEST_VERSION"  >> "$GITHUB_OUTPUT"
-            echo "✅ Eligible for stable promotion"
-          else
-            echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
-            echo "stable_version="          >> "$GITHUB_OUTPUT"
-            echo "Not yet eligible (< 5 days)"
-          fi
-
       - name: Determine versions to build
         id: determine-versions
         run: |
@@ -599,7 +529,7 @@ jobs:
               fi
               ;;
 
-            promote-image|sync-registries|mark-stable)
+            promote-image|sync-registries)
               echo "versions="       >> "$GITHUB_OUTPUT"
               echo "versions_json=[]" >> "$GITHUB_OUTPUT"
               echo "should_build=false" >> "$GITHUB_OUTPUT"
@@ -650,7 +580,6 @@ jobs:
             echo "| GHCR current | ${{ steps.check-existing.outputs.ghcr_current }} |"
             echo "| Versions to Build | ${{ steps.determine-versions.outputs.versions || 'None' }} |"
             echo "| Should Build | ${{ steps.determine-versions.outputs.should_build }} |"
-            echo "| Eligible for Stable | ${{ steps.check-stable.outputs.should_mark_stable }} |"
             echo "| Base Image Updated | ${{ steps.check-base-image.outputs.updated }} |"
             echo "| Platforms | ${{ steps.set-platforms.outputs.platforms }} |"
             echo "| Compression | ${{ needs.resolve-profile.outputs.compression_type }} level ${{ needs.resolve-profile.outputs.compression_level }} |"
@@ -1181,10 +1110,10 @@ jobs:
         with:
           dockerhub_repo: ${{ env.DOCKERHUB_REPO }}
           ghcr_repo:      ${{ env.GHCR_REPO }}
-          tags: latest,stable,${{ needs.merge-manifest.outputs.primary_tag }},${{ needs.merge-manifest.outputs.date_tag }}
+          tags: latest,${{ needs.merge-manifest.outputs.primary_tag }},${{ needs.merge-manifest.outputs.date_tag }}
 
   # ============================================================================
-  # Job 5 — Image promotion (version → latest/stable)
+  # Job 5 — Image promotion (version → latest)
   # ============================================================================
   promote-image:
     name: Promote Image
@@ -1233,59 +1162,6 @@ jobs:
             echo "| Source | Target | Status |"
             echo "|---|---|---|"
             echo "| $SRC | $TGT | ✅ Success |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # ============================================================================
-  # Job 6 — Mark stable (5-day rule with digest deduplication)
-  # ============================================================================
-  mark-stable:
-    name: Mark Stable
-    runs-on: ubuntu-latest
-    needs: [check-releases, merge-manifest, sync-registries]
-    if: |
-      always() &&
-      needs.check-releases.outputs.action_type == 'mark-stable'
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install skopeo
-        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
-
-      - name: Login to registries
-        uses: ./.github/actions/registry-login
-        with:
-          dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
-          dockerhub_token:    ${{ secrets.DOCKERHUB_TOKEN }}
-          ghcr_actor:         ${{ github.actor }}
-          ghcr_token:         ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check and promote to stable
-        run: |
-          STABLE_VERSION="${{ needs.check-releases.outputs.stable_version }}"
-          [[ -z "$STABLE_VERSION" ]] && { echo "No version eligible for stable"; exit 0; }
-
-          # Skip if :stable already points to this version
-          CURRENT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/dev/null \
-            | jq -r '.Digest' || echo "none")
-          TARGET=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" 2>/dev/null \
-            | jq -r '.Digest' || echo "none")
-
-          if [[ "$CURRENT" == "$TARGET" && "$CURRENT" != "none" ]]; then
-            echo "✅ :stable already points to $STABLE_VERSION — nothing to do"
-            exit 0
-          fi
-
-          echo "Marking $STABLE_VERSION as :stable..."
-          skopeo copy --all "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" "docker://${{ env.DOCKERHUB_REPO }}:stable"
-          skopeo copy --all "docker://${{ env.GHCR_REPO }}:${STABLE_VERSION}"      "docker://${{ env.GHCR_REPO }}:stable"
-
-          {
-            echo "## Stable Promotion"
-            echo "Version **$STABLE_VERSION** → **:stable**"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
