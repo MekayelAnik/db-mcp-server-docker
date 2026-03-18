@@ -685,30 +685,57 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 
 ## AI Client Integration
 
-### Cursor / VS Code (SSE mode)
+Most MCP clients (Claude Code, Codex-style clients, Cursor, VS Code extensions, and custom agents) accept one of these patterns:
+- URL-based MCP server over SSE (HTTP or HTTPS)
+- Command-based MCP server over STDIO
+
+The exact config file path differs per client, but the JSON object under `mcpServers` is usually similar.
+
+### Template A: HTTP + SSE
+
+Use this for local trusted development only.
 
 ```json
 {
   "mcpServers": {
-    "db-mcp-server": {
-      "url": "https://localhost:9092/sse"
+    "db-mcp-http": {
+      "url": "http://localhost:9092/sse"
     }
   }
 }
 ```
 
-If HTTPS is disabled, use `http://localhost:9092/sse` instead.
+### Template B: HTTPS + SSE + Bearer API key
 
-### Claude Desktop (STDIO mode via Docker)
+Recommended for LAN/remote use.
 
 ```json
 {
   "mcpServers": {
-    "db-mcp-server": {
+    "db-mcp-https": {
+      "url": "https://localhost:9092/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_API_KEY"
+      }
+    }
+  }
+}
+```
+
+If your client validates certificates strictly, use a trusted cert (or configure trust for your self-signed cert).
+
+### Template C: STDIO via Docker
+
+Works well for local command-based clients (including Claude Desktop/CLI style integrations).
+
+```json
+{
+  "mcpServers": {
+    "db-mcp-stdio": {
       "command": "docker",
       "args": [
         "run", "--rm", "-i",
-        "-v", "/path/to/config.json:/app/config.json",
+        "-v", "/path/to/config.json:/app/config.json:ro",
         "-e", "TRANSPORT_MODE=stdio",
         "mekayelanik/db-mcp-server:latest"
       ]
@@ -716,6 +743,81 @@ If HTTPS is disabled, use `http://localhost:9092/sse` instead.
   }
 }
 ```
+
+### Claude Code example (HTTPS + SSE)
+
+```json
+{
+  "mcpServers": {
+    "db-mcp-server": {
+      "url": "https://localhost:9092/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_API_KEY"
+      }
+    }
+  }
+}
+```
+
+### Codex-style example (HTTPS + SSE)
+
+```json
+{
+  "mcpServers": {
+    "db-mcp-server": {
+      "url": "https://localhost:9092/sse",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_API_KEY"
+      }
+    }
+  }
+}
+```
+
+### CLI templates
+
+HTTP + SSE:
+
+```bash
+docker run -d \
+  --name db-mcp-http \
+  -p 9092:9092 \
+  -e TRANSPORT_MODE=sse \
+  -e ENABLE_HTTPS=false \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  mekayelanik/db-mcp-server:latest
+```
+
+HTTPS + SSE + API key:
+
+```bash
+docker run -d \
+  --name db-mcp-https \
+  -p 9092:9092 \
+  -e TRANSPORT_MODE=sse \
+  -e ENABLE_HTTPS=true \
+  -e TLS_MIN_VERSION=TLSv1.3 \
+  -e TLS_CN=localhost \
+  -e TLS_SAN=DNS:localhost,IP:127.0.0.1 \
+  -e API_KEY='REPLACE_WITH_API_KEY' \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  mekayelanik/db-mcp-server:latest
+```
+
+STDIO:
+
+```bash
+docker run --rm -i \
+  -e TRANSPORT_MODE=stdio \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  mekayelanik/db-mcp-server:latest
+```
+
+### Quick compatibility notes for Claude Code, Codex, and similar clients
+
+- If your client supports URL-based MCP servers, prefer HTTPS + SSE template.
+- If your client supports command-based MCP servers, use the STDIO template.
+- If the client does not support custom headers in URL mode, place the container behind a trusted reverse proxy that injects auth, or use STDIO mode.
 
 ---
 
