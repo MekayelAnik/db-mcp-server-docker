@@ -20,8 +20,10 @@
     "before 6am on monday"
   ],
   "automerge": true,
+  "platformAutomerge": true,
   "automergeType": "pr",
   "automergeStrategy": "squash",
+  "rebaseWhen": "behind-base-branch",
   "prConcurrentLimit": 10,
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
@@ -44,7 +46,7 @@
       "enabled": false
     },
     {
-      "description": "GitHub Actions — major versions only (e.g. @v4 → @v5). Never automerge, never update minor/patch.",
+      "description": "GitHub Actions — major versions only (e.g. @v4 → @v5). Disable minor/patch updates.",
       "matchManagers": [
         "github-actions"
       ],
