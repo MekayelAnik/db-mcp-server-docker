@@ -1039,14 +1039,38 @@ jobs:
 
       # ── Docker Hub manifest (with retry — mirrors merge job in docker-build.yml) ──
       - name: Create Docker Hub multi-arch manifest
+        id: dockerhub-manifest
         if: github.event.inputs.push_to_dockerhub != 'false'
         run: |
           SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.DOCKERHUB_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          SUCCESS=0
+          RATE_LIMITED=0
+
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
-            docker buildx imagetools create ${{ steps.tags.outputs.dockerhub_tags }} $SOURCES && break
-            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 10))s..."; sleep $((attempt * 10)); } || exit 1
+            OUTPUT=$(docker buildx imagetools create ${{ steps.tags.outputs.dockerhub_tags }} $SOURCES 2>&1) && {
+              echo "$OUTPUT"
+              SUCCESS=1
+              break
+            }
+
+            echo "$OUTPUT"
+            if echo "$OUTPUT" | grep -Eiq 'toomanyrequests|429 Too Many Requests'; then
+              RATE_LIMITED=1
+            fi
+
+            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 10))s..."; sleep $((attempt * 10)); }
           done
+
+          if [[ $SUCCESS -eq 1 ]]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+          elif [[ $RATE_LIMITED -eq 1 ]]; then
+            echo "status=rate-limited" >> "$GITHUB_OUTPUT"
+            echo "::warning::Docker Hub rate-limited during manifest publish; continuing with GHCR as source of truth for this run."
+          else
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
       # ── GHCR manifest (with retry) ─────────────────────────────────────────
       - name: Create GHCR multi-arch manifest
@@ -1061,7 +1085,12 @@ jobs:
 
       - name: Inspect final manifest
         run: |
-          docker buildx imagetools inspect ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}
+          if [[ "${{ github.event.inputs.push_to_dockerhub || 'true' }}" == "true" && "${{ steps.dockerhub-manifest.outputs.status }}" == "success" ]]; then
+            docker buildx imagetools inspect ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}
+          else
+            echo "Docker Hub manifest unavailable or skipped; inspecting GHCR instead."
+            docker buildx imagetools inspect ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}
+          fi
 
       # ── Trivy security scan (non-blocking) ────────────────────────────────
       - name: Trivy vulnerability scan
