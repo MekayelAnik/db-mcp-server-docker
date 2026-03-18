@@ -176,9 +176,21 @@ runs:
       if: always()
       shell: bash
       run: |
+        write_rows() {
+          local status="$1"
+          local values="$2"
+          local t
+
+          for t in $values; do
+            [[ -z "$t" ]] && continue
+            echo "| $t | $status |" >> "$GITHUB_STEP_SUMMARY"
+          done
+        }
+
         echo "## Registry Sync: ${{ inputs.dockerhub_repo }}" >> "$GITHUB_STEP_SUMMARY"
         echo "| Tag(s) | Status |"                              >> "$GITHUB_STEP_SUMMARY"
         echo "|---|---|"                                         >> "$GITHUB_STEP_SUMMARY"
-        for t in ${{ steps.sync.outputs.synced_tags }};  do echo "| $t | Synced |"  >> "$GITHUB_STEP_SUMMARY"; done
-        for t in ${{ steps.sync.outputs.skipped_tags }}; do echo "| $t | Skipped |" >> "$GITHUB_STEP_SUMMARY"; done
-        for t in ${{ steps.sync.outputs.failed_tags }};  do echo "| $t | Failed |"  >> "$GITHUB_STEP_SUMMARY"; done
+
+        write_rows "Synced"  "${{ steps.sync.outputs.synced_tags }}"
+        write_rows "Skipped" "${{ steps.sync.outputs.skipped_tags }}"
+        write_rows "Failed"  "${{ steps.sync.outputs.failed_tags }}"
