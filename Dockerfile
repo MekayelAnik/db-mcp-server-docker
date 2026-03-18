@@ -48,8 +48,7 @@ RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     bash \
-    nodejs-current \
-    npm \
+    haproxy \
     netcat-openbsd \
     bind-tools \
     iputils \
@@ -59,14 +58,19 @@ WORKDIR /app
 
 COPY --from=builder /app/bin/server /app/server
 COPY config.json /app/config.json
+COPY haproxy.cfg.template /etc/haproxy/haproxy.cfg.template
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/logs \
+  && chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV SERVER_PORT=9092
+ENV INTERNAL_SERVER_PORT=38011
 ENV TRANSPORT_MODE=sse
 ENV CONFIG_PATH=/app/config.json
+ENV API_KEY=
 
 EXPOSE 9092
 VOLUME ["/app/logs"]
 
-CMD ["/bin/bash", "-c", "/app/server -t ${TRANSPORT_MODE} -p ${SERVER_PORT} -c ${CONFIG_PATH}"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
