@@ -19,6 +19,9 @@
   "schedule": [
     "before 6am on monday"
   ],
+  "automerge": true,
+  "automergeType": "pr",
+  "automergeStrategy": "squash",
   "prConcurrentLimit": 10,
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
@@ -52,14 +55,14 @@
       "enabled": false
     },
     {
-      "description": "GitHub Actions — open PR for major updates only, require manual review",
+      "description": "GitHub Actions — major updates with automerge when mergeable",
       "matchManagers": [
         "github-actions"
       ],
       "matchUpdateTypes": [
         "major"
       ],
-      "automerge": false,
+      "automerge": true,
       "minimumReleaseAge": "7 days"
     },
     {
@@ -144,13 +147,13 @@
       ]
     },
     {
-      "description": "Dockerfile base images — group all into one PR, require manual review",
+      "description": "Dockerfile base images — grouped PR with automerge when mergeable",
       "matchManagers": [
         "dockerfile"
       ],
       "groupName": "dockerfile-base-images",
       "prPriority": 4,
-      "automerge": false,
+      "automerge": true,
       "labels": [
         "dependencies",
         "docker",
