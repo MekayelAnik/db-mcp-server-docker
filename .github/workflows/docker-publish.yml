@@ -876,12 +876,10 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
-          # Two-tier cache: GHCR registry cache + GHA cache
+          # Use GHA cache only to avoid registry auth/rate-limit issues in build path.
           cache-from: |
-            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }}
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
           cache-to: |
-            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
           # Push by digest — tags applied in merge-manifest job
           outputs: >-
