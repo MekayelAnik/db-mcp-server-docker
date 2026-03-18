@@ -42,12 +42,14 @@ RUN CGO_ENABLED=1 xx-go build \
   && xx-verify ./bin/server
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM alpine:3.23
+FROM alpine:latest
 
 RUN apk add --no-cache \
     ca-certificates \
     tzdata \
     bash \
+    nodejs-current \
+    npm \
     netcat-openbsd \
     bind-tools \
     iputils \
