@@ -253,7 +253,7 @@ main() {
 
   SERVER_PORT="${SERVER_PORT:-$DEFAULT_PORT}"
   INTERNAL_SERVER_PORT="${INTERNAL_SERVER_PORT:-$DEFAULT_INTERNAL_PORT}"
-  ENABLE_HTTPS="${ENABLE_HTTPS:-false}"
+  ENABLE_HTTPS="${ENABLE_HTTPS:-true}"
   TLS_CERT_PATH="${TLS_CERT_PATH:-/etc/haproxy/certs/server.crt}"
   TLS_KEY_PATH="${TLS_KEY_PATH:-/etc/haproxy/certs/server.key}"
   TLS_PEM_PATH="${TLS_PEM_PATH:-/etc/haproxy/certs/server.pem}"

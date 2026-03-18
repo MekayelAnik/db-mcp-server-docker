@@ -118,9 +118,9 @@ docker run -d \
   mekayelanik/db-mcp-server:latest
 ```
 
-The MCP server is now available at `http://localhost:9092/sse`.
+The MCP server is now available at `https://localhost:9092/sse` by default.
 
-For production or remote access, enable HTTPS and API key auth (see Security & Transport section).
+For local HTTP-only testing, set `ENABLE_HTTPS=false`.
 
 ---
 
@@ -531,11 +531,11 @@ server {
 
 ### Should HTTPS be default?
 
-Current default is `ENABLE_HTTPS=false` for compatibility with local tooling and existing HTTP-based MCP setups.
+Current default is `ENABLE_HTTPS=true`.
 
 Recommended practice:
-- Local-only development: HTTP can be acceptable on trusted localhost-only networks.
-- Any remote/LAN/public use: enable HTTPS and API key auth.
+- Local-only development: HTTPS is still recommended, but you can set `ENABLE_HTTPS=false` for tools that only support HTTP.
+- Any remote/LAN/public use: use HTTPS and API key auth.
 
 ### What transport does this MCP expose?
 
@@ -577,6 +577,53 @@ Certificate precedence:
 1. If `TLS_PEM_PATH` exists, it is used directly.
 2. Else if both `TLS_CERT_PATH` and `TLS_KEY_PATH` exist, they are combined into PEM.
 3. Else a self-signed cert is auto-generated using `TLS_CN` and `TLS_SAN`.
+
+### Using Cloudflare Origin Certificate (recommended behind Cloudflare)
+
+If your traffic is proxied through Cloudflare, use a Cloudflare Origin Certificate instead of the auto-generated self-signed cert.
+
+1. In Cloudflare Dashboard, create an Origin Certificate for your hostname(s), for example `mcp.example.com`.
+2. Save certificate and private key PEM content to host files.
+
+```bash
+mkdir -p certs
+
+# Paste certificate PEM from Cloudflare
+cat > certs/cloudflare-origin.crt <<'EOF'
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+EOF
+
+# Paste private key PEM from Cloudflare
+cat > certs/cloudflare-origin.key <<'EOF'
+-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+EOF
+```
+
+3. Mount the files and point TLS env vars to them:
+
+```bash
+docker run -d \
+  --name db-mcp-server \
+  -p 9092:9092 \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -v $(pwd)/certs/cloudflare-origin.crt:/etc/haproxy/certs/server.crt:ro \
+  -v $(pwd)/certs/cloudflare-origin.key:/etc/haproxy/certs/server.key:ro \
+  -e ENABLE_HTTPS=true \
+  -e TLS_CERT_PATH=/etc/haproxy/certs/server.crt \
+  -e TLS_KEY_PATH=/etc/haproxy/certs/server.key \
+  -e TLS_MIN_VERSION=TLSv1.3 \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+Notes:
+- The entrypoint combines `TLS_CERT_PATH` + `TLS_KEY_PATH` into `TLS_PEM_PATH` automatically.
+- Keep key files out of git and restrict permissions (`chmod 600`).
+- In Cloudflare, use SSL/TLS mode `Full (strict)`.
 
 ### Secure run example (recommended)
 
@@ -672,7 +719,7 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 | `TRANSPORT_MODE` | `sse` | Transport mode: `sse` or `stdio` |
 | `CONFIG_PATH` | `/app/config.json` | Path to the database config file inside the container |
 | `API_KEY` | *(empty)* | Enables Bearer auth when set (validated at startup) |
-| `ENABLE_HTTPS` | `false` | Enables TLS termination in HAProxy |
+| `ENABLE_HTTPS` | `true` | Enables TLS termination in HAProxy |
 | `TLS_CERT_PATH` | `/etc/haproxy/certs/server.crt` | Certificate file path |
 | `TLS_KEY_PATH` | `/etc/haproxy/certs/server.key` | Private key file path |
 | `TLS_PEM_PATH` | `/etc/haproxy/certs/server.pem` | PEM bundle path used by HAProxy |
