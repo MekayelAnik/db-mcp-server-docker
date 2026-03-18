@@ -669,6 +669,9 @@ jobs:
           cd upstream
           git checkout ${{ env.UPSTREAM_REPO_SHA }}
           echo "✅ Checked out upstream @ ${{ env.UPSTREAM_REPO_SHA }}"
+          cp ../docker-entrypoint.sh ./docker-entrypoint.sh
+          cp ../haproxy.cfg.template ./haproxy.cfg.template
+          echo "✅ Injected HAProxy overlay files into upstream build context"
           echo "upstream_sha=${{ env.UPSTREAM_REPO_SHA }}" >> "$GITHUB_OUTPUT"
         id: upstream
 
