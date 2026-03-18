@@ -133,11 +133,17 @@ runs:
             GC_DIG=$(skopeo inspect --raw "docker://${gc_ref}" 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "")
 
             if [[ -n "$DH_DIG" && -n "$GC_DIG" && "$DH_DIG" != "$GC_DIG" ]]; then
-              echo "  → Digest mismatch — re-syncing Docker Hub → GHCR"
-              if skopeo_copy_with_retry "$tag: DH→GHCR (re-sync)" "$dh_ref" "$gc_ref"; then
-                SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync)"
+              # Prefer GHCR as source to avoid Docker Hub pull-rate limits.
+              echo "  → Digest mismatch — re-syncing GHCR → Docker Hub (preferred)"
+              if skopeo_copy_with_retry "$tag: GHCR→DH (re-sync)" "$gc_ref" "$dh_ref"; then
+                SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync GHCR→DH)"
               else
-                FAILED_TAGS="$FAILED_TAGS $tag"
+                echo "  → Fallback: re-syncing Docker Hub → GHCR"
+                if skopeo_copy_with_retry "$tag: DH→GHCR (re-sync fallback)" "$dh_ref" "$gc_ref"; then
+                  SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync DH→GHCR)"
+                else
+                  FAILED_TAGS="$FAILED_TAGS $tag"
+                fi
               fi
             else
               echo "  ✅ Already in sync — skipping"
