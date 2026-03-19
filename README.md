@@ -318,93 +318,7 @@ networks:
 
 > **Note:** Use the Docker Compose service name as the `host` value — e.g. `postgres`, `mysql` — not `localhost`.
 
----
-
-### With TimescaleDB
-
-```yaml
-services:
-  db-mcp-server:
-    image: mekayelanik/db-mcp-server:latest
-    container_name: db-mcp-server
-    restart: unless-stopped
-    ports:
-      - "9092:9092"
-    volumes:
-      - ./config.json:/app/config.json:ro
-      - logs:/app/logs
-    depends_on:
-      timescaledb:
-        condition: service_healthy
-    networks:
-      - mcp-net
-
-  timescaledb:
-    image: timescale/timescaledb-ha:pg16
-    container_name: mcp-timescaledb
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: tsdb
-      POSTGRES_USER: tsuser
-      POSTGRES_PASSWORD: tspassword
-    volumes:
-      - timescale-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tsuser -d tsdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - mcp-net
-
-volumes:
-  timescale-data:
-  logs:
-
-networks:
-  mcp-net:
-    driver: bridge
-```
-
----
-
-### With SQLite (file-based)
-
-```yaml
-services:
-  db-mcp-server:
-    image: mekayelanik/db-mcp-server:latest
-    container_name: db-mcp-server
-    restart: unless-stopped
-    ports:
-      - "9092:9092"
-    volumes:
-      - ./config.json:/app/config.json:ro
-      - ./data:/app/data          # SQLite database files live here
-      - logs:/app/logs
-    environment:
-      TRANSPORT_MODE: sse
-
-volumes:
-  logs:
-```
-
-`config.json`:
-
-```json
-{
-  "connections": [
-    {
-      "id": "sqlite_app",
-      "type": "sqlite",
-      "database_path": "/app/data/app.db",
-      "journal_mode": "WAL",
-      "cache_size": 2000,
-      "use_modernc_driver": true
-    }
-  ]
-}
-```
+For additional variants, reuse this pattern and adjust service image + `config.json` connection type/host.
 
 ---
 
@@ -819,7 +733,7 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 
 | Database | Status | Notes |
 |---|---|---|
-| PostgreSQL | ✅ Full support (v9.6–17) | Queries, transactions, schema, performance |
+| PostgreSQL | ✅ Full support (v9.6–18) | Queries, transactions, schema, performance |
 | MySQL | ✅ Full support | Queries, transactions, schema, performance |
 | SQLite | ✅ Full support | File-based, in-memory, SQLCipher encryption |
 | Oracle | ✅ Full support (10g–23c) | Standard, RAC, Cloud Wallet, TNS |
