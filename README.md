@@ -576,8 +576,8 @@ Default minimum TLS version is `TLSv1.3`.
 ### HTTP protocol versions (optional mode)
 
 Set `HTTP_VERSION_MODE` to control protocol negotiation on the public listener:
-- `auto` (default): conservative fallback mode (`h1` only)
-- `all`: enable `h1` + `h2`, and also `h3` when HAProxy QUIC support is available
+- `auto` (default): try `h3` first, then fall back to `h2`, then `h1` (`http/1.1`)
+- `all`: same behavior as `auto`
 - `h1`: force HTTP/1.1 only
 - `h2`: force HTTP/2 over TLS only
 - `h1+h2`: allow both HTTP/1.1 and HTTP/2
