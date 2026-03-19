@@ -138,6 +138,9 @@ resolve_listener_protocols() {
   local want_h3="false"
 
   case "$mode" in
+    auto)
+      alpn="http/1.1"
+      ;;
     h1)
       alpn="http/1.1"
       ;;
@@ -151,7 +154,7 @@ resolve_listener_protocols() {
       alpn="h2,http/1.1"
       want_h3="true"
       ;;
-    auto|all)
+    all)
       alpn="h2,http/1.1"
       want_h3="true"
       ;;
