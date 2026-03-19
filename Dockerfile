@@ -78,8 +78,10 @@ ENV TLS_CN=localhost
 ENV TLS_SAN=DNS:localhost
 ENV TLS_DAYS=365
 ENV TLS_MIN_VERSION=TLSv1.3
+ENV HTTP_VERSION_MODE=auto
 
 EXPOSE 9092
+EXPOSE 9092/udp
 VOLUME ["/app/logs"]
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

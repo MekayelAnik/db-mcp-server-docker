@@ -7,6 +7,7 @@ readonly DEFAULT_PROTOCOL="sse"
 readonly DEFAULT_TLS_DAYS=365
 readonly DEFAULT_TLS_CN="localhost"
 readonly DEFAULT_TLS_MIN_VERSION="TLSv1.3"
+readonly DEFAULT_HTTP_VERSION_MODE="auto"
 readonly SAFE_API_KEY_REGEX='^[A-Za-z0-9_:.@+=-]{5,128}$'
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
@@ -86,6 +87,88 @@ validate_tls_min_version() {
       printf '%s' "$fallback"
       ;;
   esac
+}
+
+normalize_http_version_mode() {
+  local raw="$1"
+  local mode
+
+  mode="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  mode="$(trim "$mode")"
+
+  case "$mode" in
+    auto|all|h1|h2|h3|h1+h2)
+      printf '%s' "$mode"
+      ;;
+    http/1.1|http1|http1.1)
+      printf 'h1'
+      ;;
+    http/2|http2)
+      printf 'h2'
+      ;;
+    http/3|http3)
+      printf 'h3'
+      ;;
+    *)
+      echo "Invalid HTTP_VERSION_MODE='${raw}', using default ${DEFAULT_HTTP_VERSION_MODE}" >&2
+      printf '%s' "$DEFAULT_HTTP_VERSION_MODE"
+      ;;
+  esac
+}
+
+haproxy_supports_quic() {
+  haproxy -vv 2>/dev/null | grep -Eiq 'USE_QUIC=1|[[:space:]]quic[[:space:]]: mode=HTTP'
+}
+
+resolve_listener_protocols() {
+  local mode="$1"
+
+  if ! is_true "$ENABLE_HTTPS"; then
+    if [[ "$mode" != "h1" ]]; then
+      echo "HTTP_VERSION_MODE='${mode}' requested without TLS; falling back to HTTP/1.1" >&2
+    fi
+
+    BIND_PARAMS=""
+    QUIC_BIND_LINE="# HTTP/3 disabled"
+    EFFECTIVE_HTTP_VERSIONS="h1"
+    return
+  fi
+
+  local alpn="http/1.1"
+  local want_h3="false"
+
+  case "$mode" in
+    h1)
+      alpn="http/1.1"
+      ;;
+    h2)
+      alpn="h2"
+      ;;
+    h1+h2)
+      alpn="h2,http/1.1"
+      ;;
+    h3)
+      alpn="h2,http/1.1"
+      want_h3="true"
+      ;;
+    auto|all)
+      alpn="h2,http/1.1"
+      want_h3="true"
+      ;;
+  esac
+
+  BIND_PARAMS="ssl crt ${TLS_PEM_PATH} ssl-min-ver ${TLS_MIN_VERSION} alpn ${alpn}"
+  EFFECTIVE_HTTP_VERSIONS="${alpn}"
+  QUIC_BIND_LINE="# HTTP/3 disabled"
+
+  if [[ "$want_h3" == "true" ]]; then
+    if haproxy_supports_quic; then
+      QUIC_BIND_LINE="bind quic4@*:${SERVER_PORT} ssl crt ${TLS_PEM_PATH} ssl-min-ver ${TLS_MIN_VERSION} alpn h3"
+      EFFECTIVE_HTTP_VERSIONS="${EFFECTIVE_HTTP_VERSIONS},h3"
+    else
+      echo "HTTP_VERSION_MODE='${mode}' requested h3, but QUIC is not available in this HAProxy build; continuing with ${alpn}" >&2
+    fi
+  fi
 }
 
 ensure_parent_dir() {
@@ -179,9 +262,13 @@ generate_haproxy_config() {
   fi
 
   local escaped_bind_directive
-  escaped_bind_directive="$(escape_sed_replacement "${BIND_DIRECTIVE}")"
+    escaped_bind_directive="$(escape_sed_replacement "${BIND_PARAMS}")"
+    local escaped_quic_bind_line
+    escaped_quic_bind_line="$(escape_sed_replacement "${QUIC_BIND_LINE}")"
 
-  sed -e "s|__BIND_DIRECTIVE__|${escaped_bind_directive}|g" \
+    sed -e "s|__SERVER_PORT__|${SERVER_PORT}|g" \
+      -e "s|__BIND_PARAMS__|${escaped_bind_directive}|g" \
+      -e "s|__QUIC_BIND_LINE__|${escaped_quic_bind_line}|g" \
       -e "s|__INTERNAL_PORT__|${INTERNAL_SERVER_PORT}|g" \
       -e "s|__SERVER_NAME__|dbmcp|g" \
       -e "s|__CORS_PREFLIGHT_CONDITION__|{ always_false }|g" \
@@ -261,20 +348,21 @@ main() {
   TLS_SAN="${TLS_SAN:-DNS:${TLS_CN}}"
   TLS_DAYS="${TLS_DAYS:-$DEFAULT_TLS_DAYS}"
   TLS_MIN_VERSION="${TLS_MIN_VERSION:-$DEFAULT_TLS_MIN_VERSION}"
+  HTTP_VERSION_MODE="${HTTP_VERSION_MODE:-$DEFAULT_HTTP_VERSION_MODE}"
 
   SERVER_PORT="$(validate_port "SERVER_PORT" "$SERVER_PORT" "$DEFAULT_PORT")"
   INTERNAL_SERVER_PORT="$(validate_port "INTERNAL_SERVER_PORT" "$INTERNAL_SERVER_PORT" "$DEFAULT_INTERNAL_PORT")"
   TLS_DAYS="$(validate_tls_days "$TLS_DAYS" "$DEFAULT_TLS_DAYS")"
   TLS_MIN_VERSION="$(validate_tls_min_version "$TLS_MIN_VERSION" "$DEFAULT_TLS_MIN_VERSION")"
+  HTTP_VERSION_MODE="$(normalize_http_version_mode "$HTTP_VERSION_MODE")"
 
   validate_api_key
 
   if is_true "$ENABLE_HTTPS"; then
     prepare_tls_pem "$TLS_CERT_PATH" "$TLS_KEY_PATH" "$TLS_PEM_PATH" "$TLS_DAYS" "$TLS_CN" "$TLS_SAN"
-    BIND_DIRECTIVE="bind *:${SERVER_PORT} ssl crt ${TLS_PEM_PATH} ssl-min-ver ${TLS_MIN_VERSION}"
-  else
-    BIND_DIRECTIVE="bind *:${SERVER_PORT}"
   fi
+
+  resolve_listener_protocols "$HTTP_VERSION_MODE"
 
   generate_haproxy_config
   start_server
@@ -288,8 +376,10 @@ main() {
 
   if is_true "$ENABLE_HTTPS"; then
     echo "HTTPS enabled on port ${SERVER_PORT}"
+    echo "HTTP versions enabled: ${EFFECTIVE_HTTP_VERSIONS}"
   else
     echo "HTTPS disabled; serving HTTP on port ${SERVER_PORT}"
+    echo "HTTP versions enabled: h1"
   fi
 
   trap shutdown SIGINT SIGTERM EXIT

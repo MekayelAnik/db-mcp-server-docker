@@ -573,6 +573,21 @@ Notes:
 If `ENABLE_HTTPS=true`, HAProxy serves TLS on `SERVER_PORT`.
 Default minimum TLS version is `TLSv1.3`.
 
+### HTTP protocol versions (optional mode)
+
+Set `HTTP_VERSION_MODE` to control protocol negotiation on the public listener:
+- `auto` (default): enable `h1` + `h2`, and also `h3` when HAProxy QUIC support is available
+- `all`: same behavior as `auto`
+- `h1`: force HTTP/1.1 only
+- `h2`: force HTTP/2 over TLS only
+- `h1+h2`: allow both HTTP/1.1 and HTTP/2
+- `h3`: request HTTP/3 support (QUIC) plus standard TLS fallback (`h1+h2`)
+
+Notes:
+- `h2` and `h3` require TLS (`ENABLE_HTTPS=true`).
+- If `ENABLE_HTTPS=false`, the listener falls back to HTTP/1.1.
+- If `h3` is requested but QUIC is unavailable in the HAProxy build, startup logs a warning and continues without `h3`.
+
 Certificate precedence:
 1. If `TLS_PEM_PATH` exists, it is used directly.
 2. Else if both `TLS_CERT_PATH` and `TLS_KEY_PATH` exist, they are combined into PEM.
@@ -727,6 +742,7 @@ Create a `config.json` and mount it to `/app/config.json` inside the container.
 | `TLS_SAN` | `DNS:localhost` | SAN used for auto-generated self-signed cert |
 | `TLS_DAYS` | `365` | Validity period for auto-generated self-signed cert |
 | `TLS_MIN_VERSION` | `TLSv1.3` | Minimum accepted TLS version for HTTPS listener (`TLSv1.2` or `TLSv1.3`) |
+| `HTTP_VERSION_MODE` | `auto` | Public listener HTTP version mode: `auto`, `all`, `h1`, `h2`, `h1+h2`, `h3` |
 
 ---
 

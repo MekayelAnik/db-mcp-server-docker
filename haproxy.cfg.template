@@ -17,7 +17,8 @@ defaults
 
 # Frontend - receives all incoming requests
 frontend mcp_frontend
-    __BIND_DIRECTIVE__
+    bind *:__SERVER_PORT__ __BIND_PARAMS__
+    __QUIC_BIND_LINE__
     
     # Define ACL for health check endpoint from localhost
     acl is_health_check path /healthz
