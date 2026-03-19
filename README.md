@@ -588,6 +588,108 @@ Notes:
 - If `ENABLE_HTTPS=false`, the listener falls back to HTTP/1.1.
 - If `h3` is requested but QUIC is unavailable in the HAProxy build, startup logs a warning and continues without `h3`.
 
+#### Recommended defaults and mode intent
+
+- Production default: `HTTP_VERSION_MODE=auto`
+- `auto` / `all`: try HTTP/3 first, then HTTP/2, then HTTP/1.1 fallback
+- `h1`: strict compatibility mode
+- `h2`: force HTTP/2-only over TLS
+- `h3`: request HTTP/3 with safe TCP fallback
+
+#### Docker CLI examples by mode
+
+Auto chain (`h3 -> h2 -> h1`) (default):
+
+```bash
+docker run -d \
+  --name db-mcp-auto \
+  -p 9092:9092 \
+  -p 9092:9092/udp \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -e ENABLE_HTTPS=true \
+  -e HTTP_VERSION_MODE=auto \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+HTTP/1.1 only:
+
+```bash
+docker run -d \
+  --name db-mcp-h1 \
+  -p 9092:9092 \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -e ENABLE_HTTPS=true \
+  -e HTTP_VERSION_MODE=h1 \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+HTTP/2 only:
+
+```bash
+docker run -d \
+  --name db-mcp-h2 \
+  -p 9092:9092 \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -e ENABLE_HTTPS=true \
+  -e HTTP_VERSION_MODE=h2 \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+HTTP/3 requested (plus fallback):
+
+```bash
+docker run -d \
+  --name db-mcp-h3 \
+  -p 9092:9092 \
+  -p 9092:9092/udp \
+  -v $(pwd)/config.json:/app/config.json:ro \
+  -e ENABLE_HTTPS=true \
+  -e HTTP_VERSION_MODE=h3 \
+  -e API_KEY='replace_with_a_strong_key' \
+  mekayelanik/db-mcp-server:latest
+```
+
+#### Docker Compose snippet
+
+```yaml
+services:
+  db-mcp-server:
+    image: mekayelanik/db-mcp-server:latest
+    ports:
+      - "9092:9092/tcp"
+      - "9092:9092/udp"
+    environment:
+      ENABLE_HTTPS: "true"
+      HTTP_VERSION_MODE: "auto"
+      API_KEY: "replace_with_a_strong_key"
+    volumes:
+      - ./config.json:/app/config.json:ro
+```
+
+#### How to verify effective mode at runtime
+
+Check startup logs:
+
+```bash
+docker logs db-mcp-auto | grep -E 'HTTP versions enabled|HTTPS enabled|falling back'
+```
+
+Inspect generated HAProxy binds:
+
+```bash
+docker exec db-mcp-auto sh -lc "grep -n 'bind ' /tmp/haproxy.cfg"
+```
+
+Expected for `auto`/`all` when QUIC is available:
+- one TLS TCP bind with ALPN `h2,http/1.1`
+- one QUIC bind with ALPN `h3`
+
+Expected for `h1`:
+- one TLS TCP bind with ALPN `http/1.1`
+
 Certificate precedence:
 1. If `TLS_PEM_PATH` exists, it is used directly.
 2. Else if both `TLS_CERT_PATH` and `TLS_KEY_PATH` exist, they are combined into PEM.
