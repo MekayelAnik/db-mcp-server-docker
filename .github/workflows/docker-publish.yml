@@ -984,7 +984,7 @@ jobs:
           push_to_ghcr:       ${{ github.event.inputs.push_to_ghcr || 'true' }}
 
       - name: Download all platform digests for this version
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digest-${{ matrix.version }}-*
