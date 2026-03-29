@@ -28,6 +28,7 @@
   <a href="#configuration">Configuration</a> •
   <a href="#supported-databases">Supported Databases</a> •
   <a href="#environment-variables">Environment Variables</a> •
+  <a href="#mcpjungle-gateway">MCPJungle Gateway</a> •
   <a href="#license">License</a>
 </div>
 
@@ -891,6 +892,62 @@ docker run --rm -i \
   -v $(pwd)/config.json:/app/config.json:ro \
   mekayelanik/db-mcp-server:latest
 ```
+
+### MCPJungle Gateway
+
+[MCPJungle](https://github.com/mcpjungle/MCPJungle) is a self-hosted MCP gateway that aggregates multiple MCP servers behind a single endpoint.
+
+> **Important:** MCPJungle's SSE transport does **not** support custom `headers` in the registration config. The `headers` field is only used for the `streamable_http` transport. For SSE with API key authentication, you **must** use `bearer_token` instead.
+
+#### SSE with API key (correct)
+
+Registration config (`mcp1.json`):
+
+```json
+{
+    "name": "db-mcp-server",
+    "url": "http://<HOST_IP>:9092/sse",
+    "transport": "sse",
+    "bearer_token": "REPLACE_WITH_API_KEY"
+}
+```
+
+Register:
+
+```bash
+mcpjungle register -c mcp1.json
+```
+
+#### SSE without API key
+
+If the container is running with `API_KEY` unset (auth disabled):
+
+```json
+{
+    "name": "db-mcp-server",
+    "url": "http://<HOST_IP>:9092/sse",
+    "transport": "sse"
+}
+```
+
+#### Common mistake
+
+The following config will **fail with 401** because `headers` is silently ignored for SSE transport in MCPJungle:
+
+```json
+{
+    "name": "db-mcp-server",
+    "url": "http://<HOST_IP>:9092/sse",
+    "transport": "sse",
+    "headers": {
+        "Authorization": "Bearer REPLACE_WITH_API_KEY"
+    }
+}
+```
+
+This is a limitation in MCPJungle's SSE client implementation (`createSSEMcpServerConn` in [util.go](https://github.com/mcpjungle/MCPJungle/blob/main/internal/service/mcp/util.go)) — the `SSEConfig` struct only supports `url` and `bearer_token`, not arbitrary headers. Use `bearer_token` instead.
+
+> **Note:** The upstream [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-server) currently only supports `sse` and `stdio` transport modes. Streamable HTTP (`streamable_http`) is not yet supported by the server, so only use `"transport": "sse"` when registering with MCPJungle.
 
 ### Quick compatibility notes for Claude Code, Codex, and similar clients
 
