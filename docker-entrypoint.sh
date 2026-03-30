@@ -409,6 +409,9 @@ main() {
   resolve_listener_protocols "$HTTP_VERSION_MODE"
 
   generate_haproxy_config
+
+  trap shutdown SIGINT SIGTERM EXIT
+
   start_server
   start_haproxy
 
@@ -425,8 +428,6 @@ main() {
     echo "HTTPS disabled; serving HTTP on port ${SERVER_PORT}"
     echo "HTTP versions enabled: h1"
   fi
-
-  trap shutdown SIGINT SIGTERM EXIT
 
   wait -n "$SERVER_PID" "$HAPROXY_PID"
 }
