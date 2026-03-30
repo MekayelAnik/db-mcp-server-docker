@@ -167,6 +167,7 @@ env:
   GHCR_REPO:        ${{ vars.GHCR_REPO        || 'ghcr.io/your-github-user/db-mcp-server' }}
   DEFAULT_PLATFORMS: ${{ vars.DEFAULT_PLATFORMS || 'linux/amd64,linux/arm64,linux/arm/v7' }}
   UPDATE_BASE_IMAGE_ENABLED: ${{ vars.UPDATE_BASE_IMAGE_ENABLED || 'false' }}
+  HAPROXY_IMAGE: ${{ vars.HAPROXY_IMAGE || 'haproxy:lts' }}
 
   # ── Upstream source tracking ──────────────────────────────────────────────
   # Renovate watches this SHA and opens a PR when FreePeak/db-mcp-server
@@ -876,6 +877,7 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
+            HAPROXY_IMAGE=${{ env.HAPROXY_IMAGE }}
           # Use GHA cache only to avoid registry auth/rate-limit issues in build path.
           cache-from: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
