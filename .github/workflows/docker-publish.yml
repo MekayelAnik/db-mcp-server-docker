@@ -152,7 +152,7 @@ on:
 # contents: read — required to checkout code
 # packages: write — overridden per-job where needed
 permissions:
-  contents: read
+  contents: write
   actions: read
   packages: read
 
@@ -192,11 +192,62 @@ env:
 
 jobs:
   # ============================================================================
-  # Job 0 — Resolve build profile
+  # Job 0a — Quick-check: read pipeline-state orphan branch, skip if unchanged
+  # ============================================================================
+  quick-check:
+    name: Quick state check
+    runs-on: ubuntu-latest
+    outputs:
+      should_continue: ${{ steps.state.outputs.should_continue }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check pipeline state
+        id: state
+        run: |
+          FORCE="${{ github.event.inputs.force_build }}"
+          ACTION="${{ github.event.inputs.action || 'auto-check' }}"
+          CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
+
+          # Non-auto-check actions always continue
+          if [[ "$ACTION" != "auto-check" ]]; then
+            echo "should_continue=true" >> "$GITHUB_OUTPUT"
+            echo "Action '$ACTION' always runs"
+            exit 0
+          fi
+
+          # Force build always continues
+          if [[ "$FORCE" == "true" ]]; then
+            echo "should_continue=true" >> "$GITHUB_OUTPUT"
+            echo "Force build requested"
+            exit 0
+          fi
+
+          # Try to read last-built SHA from pipeline-state orphan branch
+          LAST_SHA=""
+          if git fetch origin pipeline-state --depth=1 2>/dev/null; then
+            LAST_SHA=$(git show origin/pipeline-state:last-built-sha 2>/dev/null || echo "")
+          fi
+
+          if [[ -n "$LAST_SHA" && "$LAST_SHA" == "$CURRENT_SHA" ]]; then
+            echo "should_continue=false" >> "$GITHUB_OUTPUT"
+            echo "Pipeline state shows SHA $CURRENT_SHA already built -- skipping"
+          else
+            echo "should_continue=true" >> "$GITHUB_OUTPUT"
+            echo "New SHA detected (last: ${LAST_SHA:-none}, current: $CURRENT_SHA)"
+          fi
+
+  # ============================================================================
+  # Job 0b — Resolve build profile
   # Mirrors apply_build_profile() + build-compression-params() from .sh script
   # ============================================================================
   resolve-profile:
     name: Resolve build profile
+    needs: quick-check
+    if: needs.quick-check.outputs.should_continue == 'true'
     runs-on: ubuntu-latest
     outputs:
       compression_type:    ${{ steps.profile.outputs.compression_type }}
@@ -346,10 +397,27 @@ jobs:
           echo "Checking registries for commit: $CURRENT_SHA (sha-${SHORT_SHA})"
 
           # Helper: return the org.opencontainers.image.revision label of an image, or empty
+          # Retries with backoff on transient / rate-limit failures
           get_revision() {
-            skopeo inspect "docker://$1" 2>/dev/null \
-              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' \
-              || echo ""
+            local ref="$1" attempt max=3 wait
+            for attempt in $(seq 1 $max); do
+              local result err_out
+              err_out="$(mktemp)"
+              if result=$(skopeo inspect "docker://${ref}" 2>"$err_out"); then
+                rm -f "$err_out"
+                echo "$result" | jq -r '.Labels["org.opencontainers.image.revision"] // empty'
+                return 0
+              fi
+              if grep -qiE '429|toomanyrequests|rate limit' "$err_out"; then
+                wait=$(( attempt * 30 ))
+                echo "  Rate limited inspecting ${ref} — backing off ${wait}s..." >&2
+              else
+                wait=$(( attempt * 5 ))
+              fi
+              rm -f "$err_out"
+              [[ $attempt -lt $max ]] && sleep "$wait"
+            done
+            echo ""
           }
 
           # Check :latest on both registries — compare their revision label to HEAD SHA
@@ -368,8 +436,9 @@ jobs:
           [[ "$GC_SHA" == "$CURRENT_SHA" ]] && GC_CURRENT="true"
 
           # Also expose existence (for downstream steps that still need it)
-          DH_EXISTS=$(skopeo inspect "docker://$DH_REF" &>/dev/null && echo exists || echo missing)
-          GC_EXISTS=$(skopeo inspect "docker://$GC_REF" &>/dev/null && echo exists || echo missing)
+          # Re-use the revision data — if we got a revision, the image exists
+          DH_EXISTS=$([[ -n "$DH_SHA" ]] && echo exists || echo missing)
+          GC_EXISTS=$([[ -n "$GC_SHA" ]] && echo exists || echo missing)
 
           echo "dockerhub_status=$DH_EXISTS"   >> "$GITHUB_OUTPUT"
           echo "ghcr_status=$GC_EXISTS"        >> "$GITHUB_OUTPUT"
@@ -544,11 +613,21 @@ jobs:
               # Filter existing if skip_existing
               FILTERED=""
               IFS=',' read -ra ARR <<< "$INPUT"
+              # Rate-limit tolerant inspect helper
+              rl_inspect() {
+                local ref="$1" attempt
+                for attempt in 1 2 3; do
+                  if skopeo inspect "docker://${ref}" &>/dev/null; then echo yes; return 0; fi
+                  [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+                done
+                echo no
+              }
+
               for ver in "${ARR[@]}"; do
                 ver=$(echo "$ver" | xargs)
                 if [[ "$SKIP_EXISTING" == "true" && "$FORCE" != "true" ]]; then
-                  DH=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${ver}" &>/dev/null && echo yes || echo no)
-                  GC=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:${ver}"     &>/dev/null && echo yes || echo no)
+                  DH=$(rl_inspect "${{ env.DOCKERHUB_REPO }}:${ver}")
+                  GC=$(rl_inspect "${{ env.GHCR_REPO }}:${ver}")
                   if [[ "$DH" == "yes" && "$GC" == "yes" ]]; then
                     echo "::notice::Skipping $ver — already in both registries"
                     continue
@@ -651,7 +730,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 6
+      max-parallel: 4
       matrix:
         include: ${{ fromJson(needs.check-releases.outputs.build_matrix) }}
 
@@ -892,11 +971,13 @@ jobs:
             VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
             HAPROXY_IMAGE=${{ steps.haproxy.outputs.image }}
-          # Use GHA cache only to avoid registry auth/rate-limit issues in build path.
+          # GHA cache primary + GHCR registry cache fallback (zstd compression)
           cache-from: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
+            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }}
           cache-to: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
+            type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }},image-manifest=true,oci-mediatypes=true
           # Push by digest — tags applied in merge-manifest job
           outputs: >-
             ${{
@@ -1246,14 +1327,31 @@ jobs:
           SRC="${{ github.event.inputs.promote_version }}"
           TGT="${{ github.event.inputs.promote_tag }}"
 
+          # Rate-limit tolerant skopeo copy
+          skopeo_copy_rl() {
+            local src="$1" dst="$2" attempt
+            for attempt in 1 2 3; do
+              echo "  [attempt $attempt/3] $src → $dst"
+              if skopeo copy --all "docker://${src}" "docker://${dst}" 2>/tmp/rl_err; then
+                return 0
+              fi
+              if grep -qiE '429|toomanyrequests|rate limit' /tmp/rl_err; then
+                sleep $(( attempt * 30 ))
+              else
+                sleep $(( attempt * 10 ))
+              fi
+            done
+            return 1
+          }
+
           skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${SRC}" > /dev/null 2>&1 \
             || { echo "::error::Source $SRC not found in Docker Hub"; exit 1; }
 
           echo "Promoting $SRC → $TGT on Docker Hub..."
-          skopeo copy --all "docker://${{ env.DOCKERHUB_REPO }}:${SRC}" "docker://${{ env.DOCKERHUB_REPO }}:${TGT}"
+          skopeo_copy_rl "${{ env.DOCKERHUB_REPO }}:${SRC}" "${{ env.DOCKERHUB_REPO }}:${TGT}"
 
           echo "Promoting $SRC → $TGT on GHCR..."
-          skopeo copy --all "docker://${{ env.GHCR_REPO }}:${SRC}" "docker://${{ env.GHCR_REPO }}:${TGT}"
+          skopeo_copy_rl "${{ env.GHCR_REPO }}:${SRC}" "${{ env.GHCR_REPO }}:${TGT}"
 
           {
             echo "## Image Promotion"
@@ -1319,11 +1417,28 @@ jobs:
             exit 0
           fi
 
+          # Rate-limit tolerant skopeo copy
+          skopeo_copy_rl() {
+            local src="$1" dst="$2" attempt
+            for attempt in 1 2 3; do
+              echo "  [attempt $attempt/3] $src → $dst"
+              if skopeo copy --all "docker://${src}" "docker://${dst}" 2>/tmp/rl_err; then
+                return 0
+              fi
+              if grep -qiE '429|toomanyrequests|rate limit' /tmp/rl_err; then
+                sleep $(( attempt * 30 ))
+              else
+                sleep $(( attempt * 10 ))
+              fi
+            done
+            return 1
+          }
+
           echo "Marking $STABLE_VERSION as stable..."
-          skopeo copy --all "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" "docker://${{ env.DOCKERHUB_REPO }}:stable"
+          skopeo_copy_rl "${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" "${{ env.DOCKERHUB_REPO }}:stable"
 
           if [[ "${{ github.event.inputs.push_to_ghcr || 'true' }}" == "true" ]]; then
-            skopeo copy --all "docker://${{ env.GHCR_REPO }}:${STABLE_VERSION}" "docker://${{ env.GHCR_REPO }}:stable"
+            skopeo_copy_rl "${{ env.GHCR_REPO }}:${STABLE_VERSION}" "${{ env.GHCR_REPO }}:stable"
           fi
 
           {
@@ -1375,3 +1490,50 @@ jobs:
           repository: ${{ env.DOCKERHUB_REPO }}
           readme-filepath: ./README.md
           short-description: "Multi-database MCP server — MySQL, PostgreSQL, SQLite, Oracle, TimescaleDB"
+
+  # ============================================================================
+  # Job 9 — Update pipeline state (orphan branch approach)
+  # Records the last successfully built upstream SHA so quick-check can skip
+  # redundant pipeline runs.
+  # ============================================================================
+  update-state:
+    name: Update Pipeline State
+    runs-on: ubuntu-latest
+    needs: [check-releases, merge-manifest, sync-registries]
+    if: |
+      always() &&
+      needs.check-releases.outputs.action_type == 'auto-check' &&
+      needs.merge-manifest.result == 'success'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write pipeline state
+        run: |
+          CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
+
+          # Create or update the pipeline-state orphan branch
+          git fetch origin pipeline-state --depth=1 2>/dev/null && \
+            git checkout pipeline-state 2>/dev/null || \
+            git checkout --orphan pipeline-state
+
+          # Clean working tree for orphan branch
+          git rm -rf --ignore-unmatch . > /dev/null 2>&1 || true
+
+          echo "$CURRENT_SHA" > last-built-sha
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > last-built-time
+          echo "${{ needs.merge-manifest.outputs.primary_tag }}" > last-built-tag
+
+          git add last-built-sha last-built-time last-built-tag
+          git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -m "pipeline-state: built $CURRENT_SHA" --allow-empty
+          git push origin pipeline-state --force
+
+          echo "Updated pipeline-state branch with SHA $CURRENT_SHA"

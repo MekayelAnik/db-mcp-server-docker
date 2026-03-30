@@ -73,28 +73,74 @@ runs:
         SKIPPED_TAGS=""
         FAILED_TAGS=""
 
+        # ── Inspect cache (avoid redundant skopeo inspect calls) ───────────
+        declare -A _INSPECT_CACHE=()
+
+        cached_skopeo_inspect() {
+          local ref="$1"
+          if [[ -n "${_INSPECT_CACHE[$ref]+x}" ]]; then
+            echo "${_INSPECT_CACHE[$ref]}"
+            return 0
+          fi
+          local result
+          if result=$(skopeo inspect "docker://${ref}" 2>/dev/null); then
+            _INSPECT_CACHE[$ref]="$result"
+            echo "$result"
+            return 0
+          fi
+          return 1
+        }
+
+        cached_skopeo_inspect_raw() {
+          local ref="raw:$1"
+          if [[ -n "${_INSPECT_CACHE[$ref]+x}" ]]; then
+            echo "${_INSPECT_CACHE[$ref]}"
+            return 0
+          fi
+          local result
+          if result=$(skopeo inspect --raw "docker://$1" 2>/dev/null); then
+            _INSPECT_CACHE[$ref]="$result"
+            echo "$result"
+            return 0
+          fi
+          return 1
+        }
+
         # ── skopeo_copy_with_retry tag src dst ─────────────────────────────
         # Copies a multi-arch image (--all) with progressive-backoff retries.
+        # Detects Docker Hub rate limits (429/toomanyrequests) and backs off.
         skopeo_copy_with_retry() {
           local description="$1"
           local src="$2"
           local dst="$3"
           local max=${RETRY_COUNT:-3}
           local attempt=1
+          local err_file
+          err_file="$(mktemp)"
 
           while [[ $attempt -le $max ]]; do
             echo "  [attempt $attempt/$max] $description"
-            if skopeo copy --all "docker://${src}" "docker://${dst}"; then
+            if skopeo copy --all "docker://${src}" "docker://${dst}" 2>"$err_file"; then
               echo "  ✅ Success"
+              rm -f "$err_file"
               return 0
             fi
-            local wait=$(( attempt * 15 ))
-            echo "  ⚠️  Failed — retrying in ${wait}s..."
+
+            # Detect rate limiting — use longer backoff
+            if grep -qiE '429|toomanyrequests|rate limit' "$err_file"; then
+              local wait=$(( attempt * 60 ))
+              echo "  ⚠️  Rate limited — backing off ${wait}s..."
+            else
+              local wait=$(( attempt * 15 ))
+              echo "  ⚠️  Failed — retrying in ${wait}s..."
+              cat "$err_file" >&2
+            fi
             sleep "$wait"
             (( attempt++ ))
           done
 
           echo "  ❌ All $max attempts failed: $description"
+          rm -f "$err_file"
           return 1
         }
 
@@ -107,8 +153,8 @@ runs:
           echo "── Tag: $tag ──────────────────────────────────"
 
           local DH_EXISTS GC_EXISTS
-          DH_EXISTS=$(skopeo inspect "docker://${dh_ref}" &>/dev/null && echo yes || echo no)
-          GC_EXISTS=$(skopeo inspect "docker://${gc_ref}" &>/dev/null && echo yes || echo no)
+          DH_EXISTS=$(cached_skopeo_inspect "${dh_ref}" &>/dev/null && echo yes || echo no)
+          GC_EXISTS=$(cached_skopeo_inspect "${gc_ref}" &>/dev/null && echo yes || echo no)
           echo "  Docker Hub: $DH_EXISTS | GHCR: $GC_EXISTS"
 
           if [[ "$DH_EXISTS" == no && "$GC_EXISTS" == yes ]]; then
@@ -121,8 +167,8 @@ runs:
 
           elif [[ "$DH_EXISTS" == yes && "$GC_EXISTS" == yes ]]; then
             # Both present — check if digests match; re-sync if they diverged
-            DH_DIG=$(skopeo inspect --raw "docker://${dh_ref}" 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "")
-            GC_DIG=$(skopeo inspect --raw "docker://${gc_ref}" 2>/dev/null | sha256sum | cut -d' ' -f1 || echo "")
+            DH_DIG=$(cached_skopeo_inspect_raw "${dh_ref}" | sha256sum | cut -d' ' -f1 || echo "")
+            GC_DIG=$(cached_skopeo_inspect_raw "${gc_ref}" | sha256sum | cut -d' ' -f1 || echo "")
 
             if [[ -n "$DH_DIG" && -n "$GC_DIG" && "$DH_DIG" != "$GC_DIG" ]]; then
               echo "  → Digest mismatch — re-syncing GHCR → Docker Hub"
