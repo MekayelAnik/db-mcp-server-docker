@@ -8,7 +8,9 @@ readonly DEFAULT_TLS_DAYS=365
 readonly DEFAULT_TLS_CN="localhost"
 readonly DEFAULT_TLS_MIN_VERSION="TLSv1.3"
 readonly DEFAULT_HTTP_VERSION_MODE="auto"
-readonly SAFE_API_KEY_REGEX='^[A-Za-z0-9_:.@+=-]{5,128}$'
+readonly SAFE_API_KEY_REGEX='^[[:graph:]]+$'
+readonly MIN_API_KEY_LEN=5
+readonly MAX_API_KEY_LEN=256
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
 
@@ -47,15 +49,22 @@ validate_port() {
 validate_api_key() {
   API_KEY="${API_KEY:-}"
   API_KEY="$(trim "$API_KEY")"
+  local api_key_len=0
 
   if [[ -z "$API_KEY" ]]; then
     export API_KEY=""
     return
   fi
 
+  api_key_len="${#API_KEY}"
+  if (( api_key_len < MIN_API_KEY_LEN || api_key_len > MAX_API_KEY_LEN )); then
+    echo "Invalid API_KEY length (${api_key_len}). Expected ${MIN_API_KEY_LEN}-${MAX_API_KEY_LEN} characters." >&2
+    exit 1
+  fi
+
   if [[ ! "$API_KEY" =~ $SAFE_API_KEY_REGEX ]]; then
-    echo "Invalid API_KEY format. Refusing to start with malformed API key." >&2
-    return 1
+    echo "Invalid API_KEY format. Refusing to start with malformed API key (whitespace/control chars are not allowed)." >&2
+    exit 1
   fi
 
   export API_KEY
