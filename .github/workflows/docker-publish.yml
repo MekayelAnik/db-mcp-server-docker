@@ -1395,50 +1395,83 @@ jobs:
           ghcr_token:         ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Check and promote to stable
+        timeout-minutes: 15
         run: |
           STABLE_VERSION="${{ needs.check-releases.outputs.stable_version }}"
 
           # Manual mark-stable fallback: use current latest image version label.
           if [[ -z "$STABLE_VERSION" ]]; then
-            STABLE_VERSION=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+            STABLE_VERSION=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
               | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
           fi
 
           [[ -z "$STABLE_VERSION" ]] && { echo "No version eligible for stable"; exit 0; }
 
-          # Skip if :stable already points to this version
-          CURRENT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/dev/null \
-            | jq -r '.Digest' || echo "none")
-          TARGET=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" 2>/dev/null \
+          # Use GHCR as source of truth for digest comparison (no rate limits)
+          TARGET=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:${STABLE_VERSION}" 2>/dev/null \
             | jq -r '.Digest' || echo "none")
 
-          if [[ "$CURRENT" == "$TARGET" && "$CURRENT" != "none" ]]; then
-            echo "stable already points to $STABLE_VERSION - nothing to do"
+          if [[ "$TARGET" == "none" ]]; then
+            echo "Version $STABLE_VERSION not found in GHCR — skipping"
             exit 0
           fi
 
-          # Rate-limit tolerant skopeo copy
+          # Check GHCR stable
+          GHCR_STABLE=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:stable" 2>/dev/null \
+            | jq -r '.Digest' || echo "none")
+
+          # Check DH stable (rate-limit tolerant)
+          DH_STABLE="none"
+          if DH_OUT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/tmp/rl_err); then
+            DH_STABLE=$(echo "$DH_OUT" | jq -r '.Digest' || echo "none")
+          elif grep -qiE '429|toomanyrequests|rate limit' /tmp/rl_err; then
+            echo "::warning::Docker Hub rate limited during stable check"
+          fi
+
+          if [[ "$GHCR_STABLE" == "$TARGET" && "$DH_STABLE" == "$TARGET" ]]; then
+            echo "stable already points to $STABLE_VERSION on both registries — nothing to do"
+            exit 0
+          fi
+
+          # Rate-limit tolerant skopeo copy with longer backoff
           skopeo_copy_rl() {
-            local src="$1" dst="$2" attempt
-            for attempt in 1 2 3; do
-              echo "  [attempt $attempt/3] $src → $dst"
-              if skopeo copy --all "docker://${src}" "docker://${dst}" 2>/tmp/rl_err; then
+            local src="$1" dst="$2" attempts=5 attempt
+            for attempt in $(seq 1 "$attempts"); do
+              echo "  [attempt $attempt/$attempts] $src → $dst"
+              if skopeo copy --all --retry-times 2 "docker://${src}" "docker://${dst}" 2>/tmp/rl_err; then
                 return 0
               fi
               if grep -qiE '429|toomanyrequests|rate limit' /tmp/rl_err; then
-                sleep $(( attempt * 30 ))
-              else
-                sleep $(( attempt * 10 ))
+                echo "  Rate limited — backing off $(( attempt * 60 ))s"
+                sleep $(( attempt * 60 ))
+              elif [[ "$attempt" -lt "$attempts" ]]; then
+                echo "  Copy failed — retrying in $(( attempt * 15 ))s"
+                cat /tmp/rl_err >&2
+                sleep $(( attempt * 15 ))
               fi
             done
+            echo "::error::skopeo copy failed after $attempts attempts: $src → $dst"
+            cat /tmp/rl_err >&2
             return 1
           }
 
           echo "Marking $STABLE_VERSION as stable..."
-          skopeo_copy_rl "${{ env.DOCKERHUB_REPO }}:${STABLE_VERSION}" "${{ env.DOCKERHUB_REPO }}:stable"
 
-          if [[ "${{ github.event.inputs.push_to_ghcr || 'true' }}" == "true" ]]; then
+          # Promote GHCR stable first (GHCR → GHCR, no rate limits)
+          if [[ "$GHCR_STABLE" != "$TARGET" ]]; then
+            echo "Promoting GHCR :stable"
             skopeo_copy_rl "${{ env.GHCR_REPO }}:${STABLE_VERSION}" "${{ env.GHCR_REPO }}:stable"
+          else
+            echo "GHCR :stable already up to date"
+          fi
+
+          # Sync DH stable from GHCR (avoids DH read rate limits)
+          if [[ "$DH_STABLE" != "$TARGET" ]]; then
+            echo "Syncing Docker Hub :stable from GHCR"
+            skopeo_copy_rl "${{ env.GHCR_REPO }}:${STABLE_VERSION}" "${{ env.DOCKERHUB_REPO }}:stable" || \
+              echo "::warning::Docker Hub stable sync failed — GHCR stable is correct"
+          else
+            echo "Docker Hub :stable already up to date"
           fi
 
           {
