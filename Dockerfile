@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.12
+# syntax=docker/dockerfile:1
 # =============================================================================
 # db-mcp-server — Multi-stage Dockerfile
 # Supports: linux/amd64, linux/arm64, linux/arm/v7
@@ -42,8 +42,9 @@ RUN CGO_ENABLED=1 xx-go build \
   && xx-verify ./bin/server
 
 # ── HAProxy with native QUIC/H3 support ─────────────────────────────────────
-ARG HAPROXY_IMAGE=haproxy:lts
-FROM ${HAPROXY_IMAGE} AS haproxy-src
+# HAPROXY_IMAGE is injected by the CI pipeline (sed replacement before build).
+# Default: haproxy:lts (used for local builds without CI).
+FROM haproxy:lts AS haproxy-src
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:latest

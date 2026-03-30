@@ -792,7 +792,7 @@ jobs:
         with:
           driver: docker-container
           driver-opts: |
-            image=moby/buildkit:v0.21.1
+            image=moby/buildkit:master
             network=host
             env.BUILDKIT_STEP_LOG_MAX_SIZE=${{ env.BUILDKIT_STEP_LOG_MAX_SIZE }}
             env.BUILDKIT_STEP_LOG_MAX_SPEED=${{ env.BUILDKIT_STEP_LOG_MAX_SPEED }}
@@ -944,6 +944,8 @@ jobs:
             HAPROXY_IMG="$HAPROXY_FALLBACK"
           fi
           echo "Using HAProxy image: $HAPROXY_IMG"
+          # Inject resolved image directly into Dockerfile (avoids ARG before FROM bugs)
+          sed -i "s|FROM haproxy:lts AS haproxy-src|FROM ${HAPROXY_IMG} AS haproxy-src|" ./Dockerfile
           echo "image=$HAPROXY_IMG" >> "$GITHUB_OUTPUT"
 
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
@@ -970,7 +972,6 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
-            HAPROXY_IMAGE=${{ steps.haproxy.outputs.image }}
           # GHA cache primary + GHCR registry cache fallback (zstd compression)
           cache-from: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
