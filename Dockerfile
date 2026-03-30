@@ -41,6 +41,10 @@ RUN CGO_ENABLED=1 xx-go build \
     cmd/server/main.go \
   && xx-verify ./bin/server
 
+# ── HAProxy with native QUIC/H3 support ─────────────────────────────────────
+ARG HAPROXY_IMAGE=haproxy:lts
+FROM ${HAPROXY_IMAGE} AS haproxy-src
+
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:latest
 
@@ -54,6 +58,9 @@ RUN apk add --no-cache \
     bind-tools \
     iputils \
     busybox-extras
+
+# Replace Alpine HAProxy with official build (native QUIC/H3 support)
+COPY --from=haproxy-src /usr/local/sbin/haproxy /usr/sbin/haproxy
 
 WORKDIR /app
 
@@ -79,9 +86,15 @@ ENV TLS_SAN=DNS:localhost
 ENV TLS_DAYS=365
 ENV TLS_MIN_VERSION=TLSv1.3
 ENV HTTP_VERSION_MODE=auto
+ENV PUID=1000
+ENV PGID=1000
 
 EXPOSE 9092
 EXPOSE 9092/udp
 VOLUME ["/app/logs"]
+
+# L7 health check: verifies HAProxy + MCP backend respond with HTTP 200
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | nc localhost ${SERVER_PORT:-9092} | grep -q "200 OK" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

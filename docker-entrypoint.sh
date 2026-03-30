@@ -13,6 +13,9 @@ readonly MIN_API_KEY_LEN=5
 readonly MAX_API_KEY_LEN=256
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
+readonly DEFAULT_PUID=1000
+readonly DEFAULT_PGID=1000
+readonly FIRST_RUN_FILE="/tmp/first_run_complete"
 
 trim() {
   local var="$*"
@@ -30,6 +33,71 @@ is_true() {
     1|true|yes|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+handle_first_run() {
+  local uid_gid_changed=0
+
+  if [[ -z "${PUID:-}" && -z "${PGID:-}" ]]; then
+    PUID="$DEFAULT_PUID"
+    PGID="$DEFAULT_PGID"
+  elif [[ -n "${PUID:-}" && -z "${PGID:-}" ]]; then
+    if is_positive_int "$PUID"; then
+      PGID="$PUID"
+    else
+      PUID="$DEFAULT_PUID"
+      PGID="$DEFAULT_PGID"
+    fi
+  elif [[ -z "${PUID:-}" && -n "${PGID:-}" ]]; then
+    if is_positive_int "$PGID"; then
+      PUID="$PGID"
+    else
+      PUID="$DEFAULT_PUID"
+      PGID="$DEFAULT_PGID"
+    fi
+  else
+    if ! is_positive_int "$PUID"; then
+      PUID="$DEFAULT_PUID"
+    fi
+    if ! is_positive_int "$PGID"; then
+      PGID="$DEFAULT_PGID"
+    fi
+  fi
+
+  # Alpine uses addgroup/adduser instead of groupmod/usermod
+  if ! getent group appgrp >/dev/null 2>&1; then
+    addgroup -g "$PGID" appgrp 2>/dev/null || true
+  fi
+  if ! getent passwd appuser >/dev/null 2>&1; then
+    adduser -D -u "$PUID" -G appgrp -h /app appuser 2>/dev/null || true
+  fi
+
+  # Update UID/GID if they differ
+  if id appuser >/dev/null 2>&1; then
+    local current_uid current_gid
+    current_uid="$(id -u appuser)"
+    current_gid="$(id -g appuser)"
+    if [ "$current_uid" -ne "$PUID" ]; then
+      deluser appuser 2>/dev/null || true
+      adduser -D -u "$PUID" -G appgrp -h /app appuser 2>/dev/null || true
+      uid_gid_changed=1
+    fi
+    if [ "$current_gid" -ne "$PGID" ]; then
+      delgroup appgrp 2>/dev/null || true
+      addgroup -g "$PGID" appgrp 2>/dev/null || true
+      adduser appuser appgrp 2>/dev/null || true
+      uid_gid_changed=1
+    fi
+  fi
+
+  if [ "$uid_gid_changed" -eq 1 ]; then
+    echo "Updated UID/GID to PUID=${PUID}, PGID=${PGID}"
+  fi
+
+  # Ensure app directories are owned correctly
+  chown -R "${PUID}:${PGID}" /app/data /app/logs 2>/dev/null || true
+
+  touch "$FIRST_RUN_FILE"
 }
 
 validate_port() {
@@ -401,6 +469,15 @@ main() {
   HTTP_VERSION_MODE="$(normalize_http_version_mode "$HTTP_VERSION_MODE")"
 
   validate_api_key
+
+  PUID="${PUID:-$DEFAULT_PUID}"
+  PGID="${PGID:-$DEFAULT_PGID}"
+  PUID="$(trim "$PUID")"
+  PGID="$(trim "$PGID")"
+
+  if [[ ! -f "$FIRST_RUN_FILE" ]]; then
+    handle_first_run
+  fi
 
   if is_true "$ENABLE_HTTPS"; then
     prepare_tls_pem "$TLS_CERT_PATH" "$TLS_KEY_PATH" "$TLS_PEM_PATH" "$TLS_DAYS" "$TLS_CN" "$TLS_SAN"
