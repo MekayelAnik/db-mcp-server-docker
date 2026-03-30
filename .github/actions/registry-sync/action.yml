@@ -37,10 +37,6 @@ inputs:
   tags:
     description: 'Comma-separated list of tags to sync (e.g., latest,stable,1.8.0)'
     required: true
-  concurrency:
-    description: 'Number of tags to sync in parallel (default: 3)'
-    required: false
-    default: '3'
   retry_count:
     description: 'Number of skopeo copy retries on transient failures (default: 3)'
     required: false

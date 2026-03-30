@@ -1344,8 +1344,8 @@ jobs:
             return 1
           }
 
-          skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:${SRC}" > /dev/null 2>&1 \
-            || { echo "::error::Source $SRC not found in Docker Hub"; exit 1; }
+          skopeo inspect "docker://${{ env.GHCR_REPO }}:${SRC}" > /dev/null 2>&1 \
+            || { echo "::error::Source $SRC not found in GHCR"; exit 1; }
 
           echo "Promoting $SRC → $TGT on Docker Hub..."
           skopeo_copy_rl "${{ env.DOCKERHUB_REPO }}:${SRC}" "${{ env.DOCKERHUB_REPO }}:${TGT}"
@@ -1564,9 +1564,13 @@ jobs:
           echo "${{ needs.merge-manifest.outputs.primary_tag }}" > last-built-tag
 
           git add last-built-sha last-built-time last-built-tag
-          git -c user.name="github-actions[bot]" \
-              -c user.email="github-actions[bot]@users.noreply.github.com" \
-              commit -m "pipeline-state: built $CURRENT_SHA" --allow-empty
-          git push origin pipeline-state --force
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" \
+                -c user.email="github-actions[bot]@users.noreply.github.com" \
+                commit -m "pipeline-state: built $CURRENT_SHA"
+            git push origin pipeline-state
+          else
+            echo "No changes to pipeline state — skipping commit"
+          fi
 
           echo "Updated pipeline-state branch with SHA $CURRENT_SHA"
