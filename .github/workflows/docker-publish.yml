@@ -501,35 +501,43 @@ jobs:
       - name: Check 5-day stable promotion eligibility
         id: check-stable
         run: |
-          # Read current :latest image creation date from Docker Hub
-          LATEST_CREATED=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
-            | jq -r '.Created' || echo "")
+          # ── Read latest_sha_since from pipeline-state branch ──
+          # This tracks when the current version first became :latest.
+          # Only promote to :stable after 5 continuous days as :latest.
+          LATEST_SHA_SINCE=""
+          STATE_SHA=""
+          if git fetch origin pipeline-state --depth=1 2>/dev/null; then
+            LATEST_SHA_SINCE=$(git show origin/pipeline-state:latest-sha-since 2>/dev/null || echo "")
+            STATE_SHA=$(git show origin/pipeline-state:last-built-sha 2>/dev/null || echo "")
+          fi
 
-          if [[ -z "$LATEST_CREATED" ]]; then
+          # Get the version label from current latest image (use GHCR to avoid DH rate limits)
+          LATEST_VERSION=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
+            | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+
+          if [[ -z "$LATEST_SHA_SINCE" || -z "$STATE_SHA" ]]; then
+            echo "No pipeline-state tracking data found — not yet eligible"
             echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
             echo "stable_version="          >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          LATEST_EPOCH=$(date -d "$LATEST_CREATED" +%s 2>/dev/null || echo "0")
+          SINCE_EPOCH=$(date -d "$LATEST_SHA_SINCE" +%s 2>/dev/null || echo "0")
           NOW=$(date +%s)
           FIVE_DAYS=$(( 5 * 24 * 3600 ))
-          DAYS_OLD=$(( (NOW - LATEST_EPOCH) / 86400 ))
+          DAYS_AS_LATEST=$(( (NOW - SINCE_EPOCH) / 86400 ))
 
-          # Get the version label from current latest image
-          LATEST_VERSION=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
-            | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+          echo "Current :latest SHA has been active since $LATEST_SHA_SINCE ($DAYS_AS_LATEST days)"
+          echo "  state SHA: $STATE_SHA | version: ${LATEST_VERSION:-unknown}"
 
-          echo "Latest image is $DAYS_OLD days old (version: ${LATEST_VERSION:-unknown})"
-
-          if [[ $LATEST_EPOCH -gt 0 && $(( NOW - LATEST_EPOCH )) -ge $FIVE_DAYS ]]; then
+          if [[ $SINCE_EPOCH -gt 0 && $(( NOW - SINCE_EPOCH )) -ge $FIVE_DAYS ]]; then
             echo "should_mark_stable=true"         >> "$GITHUB_OUTPUT"
             echo "stable_version=$LATEST_VERSION"  >> "$GITHUB_OUTPUT"
-            echo "Eligible for stable promotion"
+            echo "Eligible for stable promotion (>= 5 continuous days as :latest)"
           else
             echo "should_mark_stable=false" >> "$GITHUB_OUTPUT"
             echo "stable_version="          >> "$GITHUB_OUTPUT"
-            echo "Not yet eligible (< 5 days)"
+            echo "Not yet eligible ($DAYS_AS_LATEST days < 5 days required)"
           fi
 
       - name: Determine versions to build
@@ -1400,10 +1408,32 @@ jobs:
         run: |
           STABLE_VERSION="${{ needs.check-releases.outputs.stable_version }}"
 
-          # Manual mark-stable fallback: use current latest image version label.
+          # Manual mark-stable fallback: verify 5-day rule from pipeline-state
           if [[ -z "$STABLE_VERSION" ]]; then
-            STABLE_VERSION=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
-              | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+            # Read latest_sha_since from pipeline-state to verify 5-day rule
+            LATEST_SHA_SINCE=""
+            if git fetch origin pipeline-state --depth=1 2>/dev/null; then
+              LATEST_SHA_SINCE=$(git show origin/pipeline-state:latest-sha-since 2>/dev/null || echo "")
+            fi
+
+            if [[ -n "$LATEST_SHA_SINCE" ]]; then
+              SINCE_EPOCH=$(date -d "$LATEST_SHA_SINCE" +%s 2>/dev/null || echo "0")
+              NOW=$(date +%s)
+              FIVE_DAYS=$(( 5 * 24 * 3600 ))
+              DAYS_AS_LATEST=$(( (NOW - SINCE_EPOCH) / 86400 ))
+
+              if [[ $SINCE_EPOCH -gt 0 && $(( NOW - SINCE_EPOCH )) -ge $FIVE_DAYS ]]; then
+                STABLE_VERSION=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
+                  | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+                echo "Manual mark-stable: version $STABLE_VERSION has been :latest for $DAYS_AS_LATEST days — eligible"
+              else
+                echo "Manual mark-stable: :latest has only been active for $DAYS_AS_LATEST days (< 5 required) — skipping"
+                exit 0
+              fi
+            else
+              echo "No pipeline-state tracking data found — cannot verify 5-day rule"
+              exit 0
+            fi
           fi
 
           [[ -z "$STABLE_VERSION" ]] && { echo "No version eligible for stable"; exit 0; }
@@ -1551,27 +1581,45 @@ jobs:
       - name: Write pipeline state
         run: |
           CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Read previous state before switching branches
+          PREV_SHA=""
+          PREV_LATEST_SHA_SINCE=""
+          if git fetch origin pipeline-state --depth=1 2>/dev/null; then
+            PREV_SHA=$(git show origin/pipeline-state:last-built-sha 2>/dev/null || echo "")
+            PREV_LATEST_SHA_SINCE=$(git show origin/pipeline-state:latest-sha-since 2>/dev/null || echo "")
+          fi
+
+          # Determine latest_sha_since: reset if SHA changed, preserve if same
+          if [[ "$CURRENT_SHA" != "$PREV_SHA" || -z "$PREV_LATEST_SHA_SINCE" ]]; then
+            LATEST_SHA_SINCE="$NOW"
+            echo "SHA changed (${PREV_SHA:-none} -> $CURRENT_SHA) — resetting latest_sha_since to $NOW"
+          else
+            LATEST_SHA_SINCE="$PREV_LATEST_SHA_SINCE"
+            echo "SHA unchanged ($CURRENT_SHA) — preserving latest_sha_since=$LATEST_SHA_SINCE"
+          fi
 
           # Create or update the pipeline-state orphan branch
-          git fetch origin pipeline-state --depth=1 2>/dev/null && \
-            git checkout pipeline-state 2>/dev/null || \
+          git checkout pipeline-state 2>/dev/null || \
             git checkout --orphan pipeline-state
 
           # Clean working tree for orphan branch
           git rm -rf --ignore-unmatch . > /dev/null 2>&1 || true
 
-          echo "$CURRENT_SHA" > last-built-sha
-          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > last-built-time
+          echo "$CURRENT_SHA"    > last-built-sha
+          echo "$NOW"            > last-built-time
           echo "${{ needs.merge-manifest.outputs.primary_tag }}" > last-built-tag
+          echo "$LATEST_SHA_SINCE" > latest-sha-since
 
-          git add last-built-sha last-built-time last-built-tag
+          git add last-built-sha last-built-time last-built-tag latest-sha-since
           if ! git diff --cached --quiet; then
             git -c user.name="github-actions[bot]" \
                 -c user.email="github-actions[bot]@users.noreply.github.com" \
-                commit -m "pipeline-state: built $CURRENT_SHA"
+                commit -m "pipeline-state: built $CURRENT_SHA (latest_since=$LATEST_SHA_SINCE)"
             git push origin pipeline-state
           else
             echo "No changes to pipeline state — skipping commit"
           fi
 
-          echo "Updated pipeline-state branch with SHA $CURRENT_SHA"
+          echo "Updated pipeline-state branch with SHA $CURRENT_SHA, latest_sha_since=$LATEST_SHA_SINCE"
