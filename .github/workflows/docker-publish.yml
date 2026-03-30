@@ -853,6 +853,20 @@ jobs:
           echo "Version:     ${{ matrix.version }}"
           echo "Timeout:     ${{ needs.check-releases.outputs.build_timeout_min }}min"
 
+      # ── Resolve HAProxy image (GHCR mirror with Docker Hub fallback) ───────
+      - name: Resolve HAProxy image
+        id: haproxy
+        run: |
+          set -euo pipefail
+          HAPROXY_IMG="${{ env.HAPROXY_IMAGE }}"
+          if ! docker buildx imagetools inspect "$HAPROXY_IMG" >/dev/null 2>&1; then
+            HAPROXY_FALLBACK="${HAPROXY_IMG##*/}"
+            echo "HAProxy image '$HAPROXY_IMG' not available, falling back to '$HAPROXY_FALLBACK'"
+            HAPROXY_IMG="$HAPROXY_FALLBACK"
+          fi
+          echo "Using HAProxy image: $HAPROXY_IMG"
+          echo "image=$HAPROXY_IMG" >> "$GITHUB_OUTPUT"
+
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
       - name: Build and push by digest
         id: build
@@ -877,7 +891,7 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
-            HAPROXY_IMAGE=${{ env.HAPROXY_IMAGE }}
+            HAPROXY_IMAGE=${{ steps.haproxy.outputs.image }}
           # Use GHA cache only to avoid registry auth/rate-limit issues in build path.
           cache-from: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
