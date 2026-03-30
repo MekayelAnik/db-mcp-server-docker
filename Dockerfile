@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.12
 # =============================================================================
 # db-mcp-server — Multi-stage Dockerfile
 # Supports: linux/amd64, linux/arm64, linux/arm/v7
