@@ -692,7 +692,8 @@ jobs:
               {
                 version: $v,
                 platform: $p,
-                platform_slug: ($p | gsub("/"; "-"))
+                platform_slug: ($p | gsub("/"; "-")),
+                runner: (if $p == "linux/amd64" then "ubuntu-latest" else "ubuntu-24.04-arm" end)
               }
             ]
           ')
@@ -731,7 +732,7 @@ jobs:
   # ============================================================================
   build-platform:
     name: Build ${{ matrix.version }} (${{ matrix.platform_slug }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     needs: check-releases
     if: needs.check-releases.outputs.should_build == 'true' && needs.check-releases.outputs.build_matrix != '[]' && needs.check-releases.outputs.build_matrix != ''
 
@@ -795,9 +796,9 @@ jobs:
           echo "opt_workers=$OPT_W"   >> "$GITHUB_OUTPUT"
           echo "System: ${CPU}c / ${MEM_GB}GB → using ${OPT_CPU}c / ${OPT_MEM}GB @ ${RL}%"
 
-      # ── QEMU only for cross-platform builds (saves time on amd64) ──────────
+      # ── QEMU only for cross-platform builds (arm64 is native on ARM runner) ──
       - name: Set up QEMU
-        if: matrix.platform != 'linux/amd64'
+        if: matrix.platform == 'linux/arm/v7'
         uses: docker/setup-qemu-action@v4
         with:
           platforms: ${{ matrix.platform }}
