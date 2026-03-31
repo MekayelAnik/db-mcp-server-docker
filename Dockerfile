@@ -95,8 +95,8 @@ EXPOSE 9092
 EXPOSE 9092/udp
 VOLUME ["/app/logs"]
 
-# Health check: L7 for HTTP, falls back to L4 for HTTPS (nc can't do TLS)
+# L7 health check: auto-detects HTTP/HTTPS via ENABLE_HTTPS env var
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD sh -c 'printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | nc localhost ${SERVER_PORT:-9092} 2>/dev/null | grep -q "200 OK" || nc -z localhost ${SERVER_PORT:-9092}'
+    CMD sh -c 'wget -q --spider --no-check-certificate $([ "$ENABLE_HTTPS" = "true" ] && echo https || echo http)://localhost:${SERVER_PORT:-9092}/healthz'
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
