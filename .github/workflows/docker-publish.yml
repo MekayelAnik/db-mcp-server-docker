@@ -1274,7 +1274,7 @@ jobs:
     if: |
       always() &&
       (needs.check-releases.outputs.action_type == 'sync-registries' ||
-       (needs.check-releases.outputs.action_type == 'auto-check' && needs.merge-manifest.result == 'success'))
+       needs.merge-manifest.result == 'success')
 
     permissions:
       contents: read
@@ -1546,7 +1546,7 @@ jobs:
     name: Update Docker Hub Description
     runs-on: ubuntu-latest
     needs: merge-manifest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.merge-manifest.result == 'success'
 
     steps:
       - name: Checkout
@@ -1574,7 +1574,6 @@ jobs:
     needs: [check-releases, merge-manifest, sync-registries]
     if: |
       always() &&
-      needs.check-releases.outputs.action_type == 'auto-check' &&
       needs.merge-manifest.result == 'success'
 
     permissions:
