@@ -821,20 +821,29 @@ jobs:
             env.BUILDKIT_INLINE_CACHE=1
             env.BUILDKIT_CACHE_MOUNT_NS=buildkit
             env.BUILDKIT_CACHE_SHARE_MODE=shared
-          buildkitd-flags: --debug --allow-insecure-entitlement network.host
-          # Inline GC + registry mirror config (from docker-build.yml buildkitd-config-inline)
+          buildkitd-flags: --allow-insecure-entitlement network.host
+          # Inline BuildKit config: DNS, GC, history, registry mirror
           buildkitd-config-inline: |
+            [dns]
+              nameservers = ["1.1.1.1", "1.0.0.1", "95.85.95.85", "2.56.220.2"]
+              options = ["ndots:0", "attempts:2", "timeout:3"]
+            [history]
+              maxAge = 0
+              maxEntries = 0
             [worker.oci]
               max-parallelism = 4
               gc = true
-              gckeepstorage = 20000000000
+              reservedSpace = "2GB"
+              maxUsedSpace = "12GB"
+              minFreeSpace = "2GB"
+              cniPoolSize = 16
               [[worker.oci.gcpolicy]]
-                keepBytes = 20000000000
-                keepDuration = 604800
+                keepBytes = 4000000000
+                keepDuration = 86400
                 filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
               [[worker.oci.gcpolicy]]
                 all = true
-                keepBytes = 50000000000
+                keepBytes = 8000000000
             [registry."docker.io"]
               mirrors = ["mirror.gcr.io"]
 

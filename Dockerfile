@@ -34,7 +34,9 @@ COPY . .
 
 # xx-go sets GOOS, GOARCH, GOARM, CC, and CGO_ENABLED=1 automatically.
 # -trimpath and -s -w reduce binary size.
-RUN CGO_ENABLED=1 xx-go build \
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=1 xx-go build \
     -trimpath \
     -ldflags="-s -w" \
     -o ./bin/server \

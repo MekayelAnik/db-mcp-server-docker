@@ -25,7 +25,7 @@
 # =============================================================================
 
 name: 'Registry Sync'
-description: 'One-way sync of Docker images from GHCR (primary) to Docker Hub (secondary) using skopeo'
+description: 'One-way sync of Docker images from GHCR (primary) to Docker Hub (secondary) using crane (skopeo fallback)'
 
 inputs:
   dockerhub_repo:
@@ -69,43 +69,52 @@ runs:
         SKIPPED_TAGS=""
         FAILED_TAGS=""
 
-        # ── Inspect cache (avoid redundant skopeo inspect calls) ───────────
-        declare -A _INSPECT_CACHE=()
+        # ── Install crane if not available ─────────────────────────────────
+        if ! command -v crane >/dev/null 2>&1; then
+            CRANE_VERSION="$(curl -fsSL https://api.github.com/repos/google/go-containerregistry/releases/latest | jq -r .tag_name)"
+            curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" | tar xzf - -C /usr/local/bin crane
+        fi
+        USE_CRANE=$(command -v crane >/dev/null 2>&1 && echo true || echo false)
 
-        cached_skopeo_inspect() {
+        # ── Digest helpers (crane preferred, skopeo fallback) ──────────────
+        declare -A _DIGEST_CACHE=()
+
+        get_digest() {
           local ref="$1"
-          if [[ -n "${_INSPECT_CACHE[$ref]+x}" ]]; then
-            echo "${_INSPECT_CACHE[$ref]}"
+          if [[ -n "${_DIGEST_CACHE[$ref]+x}" ]]; then
+            echo "${_DIGEST_CACHE[$ref]}"
             return 0
           fi
-          local result
-          if result=$(skopeo inspect "docker://${ref}" 2>/dev/null); then
-            _INSPECT_CACHE[$ref]="$result"
-            echo "$result"
-            return 0
+          local digest=""
+          if [[ "$USE_CRANE" == true ]]; then
+            digest=$(crane digest "$ref" 2>/dev/null) || digest=""
           fi
-          return 1
-        }
-
-        cached_skopeo_inspect_raw() {
-          local ref="raw:$1"
-          if [[ -n "${_INSPECT_CACHE[$ref]+x}" ]]; then
-            echo "${_INSPECT_CACHE[$ref]}"
-            return 0
+          if [[ -z "$digest" ]] && command -v skopeo >/dev/null 2>&1; then
+            digest=$(skopeo inspect --raw "docker://$ref" 2>/dev/null | sha256sum | cut -d' ' -f1) || digest=""
           fi
-          local result
-          if result=$(skopeo inspect --raw "docker://$1" 2>/dev/null); then
-            _INSPECT_CACHE[$ref]="$result"
-            echo "$result"
+          if [[ -n "$digest" ]]; then
+            _DIGEST_CACHE[$ref]="$digest"
+            echo "$digest"
             return 0
           fi
           return 1
         }
 
-        # ── skopeo_copy_with_retry tag src dst ─────────────────────────────
-        # Copies a multi-arch image (--all) with progressive-backoff retries.
-        # Detects Docker Hub rate limits (429/toomanyrequests) and backs off.
-        skopeo_copy_with_retry() {
+        ref_exists() {
+          local ref="$1"
+          if [[ "$USE_CRANE" == true ]]; then
+            crane digest "$ref" &>/dev/null && return 0
+          fi
+          if command -v skopeo >/dev/null 2>&1; then
+            skopeo inspect "docker://$ref" &>/dev/null && return 0
+          fi
+          return 1
+        }
+
+        # ── copy_with_retry tag src dst ────────────────────────────────────
+        # Copies a multi-arch image with progressive-backoff retries.
+        # Uses crane copy (server-side, no local pull) with skopeo fallback.
+        copy_with_retry() {
           local description="$1"
           local src="$2"
           local dst="$3"
@@ -116,7 +125,19 @@ runs:
 
           while [[ $attempt -le $max ]]; do
             echo "  [attempt $attempt/$max] $description"
-            if skopeo copy --all "docker://${src}" "docker://${dst}" 2>"$err_file"; then
+            local copy_ok=false
+            if [[ "$USE_CRANE" == true ]]; then
+              if crane copy "$src" "$dst" 2>"$err_file"; then
+                copy_ok=true
+              fi
+            fi
+            if [[ "$copy_ok" != true ]] && command -v skopeo >/dev/null 2>&1; then
+              echo "  (falling back to skopeo)"
+              if skopeo copy --all "docker://${src}" "docker://${dst}" 2>"$err_file"; then
+                copy_ok=true
+              fi
+            fi
+            if [[ "$copy_ok" == true ]]; then
               echo "  ✅ Success"
               rm -f "$err_file"
               return 0
@@ -149,13 +170,13 @@ runs:
           echo "── Tag: $tag ──────────────────────────────────"
 
           local DH_EXISTS GC_EXISTS
-          DH_EXISTS=$(cached_skopeo_inspect "${dh_ref}" &>/dev/null && echo yes || echo no)
-          GC_EXISTS=$(cached_skopeo_inspect "${gc_ref}" &>/dev/null && echo yes || echo no)
+          DH_EXISTS=$(ref_exists "${dh_ref}" && echo yes || echo no)
+          GC_EXISTS=$(ref_exists "${gc_ref}" && echo yes || echo no)
           echo "  Docker Hub: $DH_EXISTS | GHCR: $GC_EXISTS"
 
           if [[ "$DH_EXISTS" == no && "$GC_EXISTS" == yes ]]; then
             echo "  → Syncing GHCR → Docker Hub"
-            if skopeo_copy_with_retry "$tag: GHCR→DH" "$gc_ref" "$dh_ref"; then
+            if copy_with_retry "$tag: GHCR→DH" "$gc_ref" "$dh_ref"; then
               SYNCED_TAGS="$SYNCED_TAGS $tag(GHCR→DH)"
             else
               FAILED_TAGS="$FAILED_TAGS $tag"
@@ -163,12 +184,12 @@ runs:
 
           elif [[ "$DH_EXISTS" == yes && "$GC_EXISTS" == yes ]]; then
             # Both present — check if digests match; re-sync if they diverged
-            DH_DIG=$(cached_skopeo_inspect_raw "${dh_ref}" | sha256sum | cut -d' ' -f1 || echo "")
-            GC_DIG=$(cached_skopeo_inspect_raw "${gc_ref}" | sha256sum | cut -d' ' -f1 || echo "")
+            DH_DIG=$(get_digest "${dh_ref}" || echo "")
+            GC_DIG=$(get_digest "${gc_ref}" || echo "")
 
             if [[ -n "$DH_DIG" && -n "$GC_DIG" && "$DH_DIG" != "$GC_DIG" ]]; then
               echo "  → Digest mismatch — re-syncing GHCR → Docker Hub"
-              if skopeo_copy_with_retry "$tag: GHCR→DH (re-sync)" "$gc_ref" "$dh_ref"; then
+              if copy_with_retry "$tag: GHCR→DH (re-sync)" "$gc_ref" "$dh_ref"; then
                 SYNCED_TAGS="$SYNCED_TAGS $tag(re-sync GHCR→DH)"
               else
                 FAILED_TAGS="$FAILED_TAGS $tag"
