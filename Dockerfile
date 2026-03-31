@@ -97,6 +97,6 @@ VOLUME ["/app/logs"]
 
 # L7 health check: auto-detects HTTP/HTTPS via ENABLE_HTTPS env var
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD sh -c 'wget -q --spider --no-check-certificate $([ "$ENABLE_HTTPS" = "true" ] && echo https || echo http)://localhost:${SERVER_PORT:-9092}/healthz'
+    CMD sh -c 'wget -q --spider --no-check-certificate $([ "$ENABLE_HTTPS" = "true" ] && echo https || echo http)://127.0.0.1:${SERVER_PORT:-9092}/healthz'
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
