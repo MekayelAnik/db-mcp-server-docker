@@ -604,10 +604,18 @@ jobs:
             build-versions)
               INPUT="${{ github.event.inputs.versions }}"
               if [[ -z "$INPUT" ]]; then
-                echo "versions=" >> "$GITHUB_OUTPUT"
-                echo "versions_json=[]" >> "$GITHUB_OUTPUT"
-                echo "should_build=false" >> "$GITHUB_OUTPUT"
-                exit 0
+                if [[ "$FORCE" == "true" ]]; then
+                  # Force build without explicit versions: resolve current version from registry
+                  INPUT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+                    | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+                  [[ -z "$INPUT" ]] && INPUT="latest-from-source"
+                  echo "⚡ Force build: no versions specified, using '$INPUT'"
+                else
+                  echo "versions=" >> "$GITHUB_OUTPUT"
+                  echo "versions_json=[]" >> "$GITHUB_OUTPUT"
+                  echo "should_build=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
               fi
 
               # Range detection: X.Y.Z-A.B.C format
