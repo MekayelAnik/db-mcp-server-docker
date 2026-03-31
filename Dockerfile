@@ -43,8 +43,8 @@ RUN CGO_ENABLED=1 xx-go build \
 
 # ── HAProxy with native QUIC/H3 support ─────────────────────────────────────
 # HAPROXY_IMAGE is injected by the CI pipeline (sed replacement before build).
-# Default: haproxy:lts (used for local builds without CI).
-FROM haproxy:lts AS haproxy-src
+# Default: haproxy:lts-alpine (used for local builds without CI).
+FROM haproxy:lts-alpine AS haproxy-src
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM alpine:latest

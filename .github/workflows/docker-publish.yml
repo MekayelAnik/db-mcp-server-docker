@@ -167,7 +167,7 @@ env:
   GHCR_REPO:        ${{ vars.GHCR_REPO        || 'ghcr.io/your-github-user/db-mcp-server' }}
   DEFAULT_PLATFORMS: ${{ vars.DEFAULT_PLATFORMS || 'linux/amd64,linux/arm64,linux/arm/v7' }}
   UPDATE_BASE_IMAGE_ENABLED: ${{ vars.UPDATE_BASE_IMAGE_ENABLED || 'false' }}
-  HAPROXY_IMAGE: ${{ vars.HAPROXY_IMAGE || 'haproxy:lts' }}
+  HAPROXY_IMAGE: ${{ vars.HAPROXY_IMAGE || 'haproxy:lts-alpine' }}
 
   # ── Upstream source tracking ──────────────────────────────────────────────
   # Renovate watches this SHA and opens a PR when FreePeak/db-mcp-server
@@ -953,7 +953,7 @@ jobs:
           fi
           echo "Using HAProxy image: $HAPROXY_IMG"
           # Inject resolved image directly into Dockerfile (avoids ARG before FROM bugs)
-          sed -i "s|FROM haproxy:lts AS haproxy-src|FROM ${HAPROXY_IMG} AS haproxy-src|" ./Dockerfile
+          sed -i "s|FROM haproxy:lts-alpine AS haproxy-src|FROM ${HAPROXY_IMG} AS haproxy-src|" ./Dockerfile
           echo "image=$HAPROXY_IMG" >> "$GITHUB_OUTPUT"
 
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
