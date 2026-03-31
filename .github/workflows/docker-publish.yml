@@ -682,9 +682,10 @@ jobs:
             exit 0
           fi
 
-          # Build [{version, platform, platform_slug}, ...]
+          # Build [{version, platform, platform_slug, runner}, ...]
+          ARM_RUNNER="ubuntu-${{ vars.RUNNER_UBUNTU_VERSION || '24.04' }}-arm"
           PLATFORM_JSON=$(echo "$PLATFORMS" | jq -Rc 'split(",")')
-          MATRIX=$(echo "$VERSIONS" | jq -c --argjson plats "$PLATFORM_JSON" '
+          MATRIX=$(echo "$VERSIONS" | jq -c --argjson plats "$PLATFORM_JSON" --arg arm_runner "$ARM_RUNNER" '
             . as $vers |
             [
               $vers[] as $v |
@@ -693,7 +694,7 @@ jobs:
                 version: $v,
                 platform: $p,
                 platform_slug: ($p | gsub("/"; "-")),
-                runner: (if $p == "linux/amd64" then "ubuntu-latest" else "ubuntu-24.04-arm" end)
+                runner: (if $p == "linux/amd64" then "ubuntu-latest" else $arm_runner end)
               }
             ]
           ')
