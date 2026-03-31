@@ -95,8 +95,9 @@ EXPOSE 9092
 EXPOSE 9092/udp
 VOLUME ["/app/logs"]
 
-# L7 health check: auto-detects HTTP/HTTPS via ENABLE_HTTPS env var
+# L4 health check: verify HAProxy port is accepting connections
+# (upstream Go server has no /healthz endpoint, only SSE streams)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD sh -c 'wget -q --spider --no-check-certificate $([ "$ENABLE_HTTPS" = "true" ] && echo https || echo http)://127.0.0.1:${SERVER_PORT:-9092}/healthz'
+    CMD nc -z 127.0.0.1 ${SERVER_PORT:-9092}
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
