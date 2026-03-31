@@ -62,7 +62,7 @@ RUN apk add --no-cache \
 
 # Replace Alpine HAProxy with official build (native QUIC/H3 support)
 COPY --from=haproxy-src /usr/local/sbin/haproxy /usr/sbin/haproxy
-RUN ln -sf /usr/sbin/haproxy /usr/local/sbin/haproxy
+RUN mkdir -p /usr/local/sbin && ln -sf /usr/sbin/haproxy /usr/local/sbin/haproxy
 
 WORKDIR /app
 
