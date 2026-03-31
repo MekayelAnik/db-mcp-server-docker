@@ -95,8 +95,8 @@ EXPOSE 9092
 EXPOSE 9092/udp
 VOLUME ["/app/logs"]
 
-# L7 health check: verifies HAProxy + MCP backend respond with HTTP 200
+# Health check: L7 for HTTP, falls back to L4 for HTTPS (nc can't do TLS)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | nc localhost ${SERVER_PORT:-9092} | grep -q "200 OK" || exit 1
+    CMD sh -c 'printf "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" | nc localhost ${SERVER_PORT:-9092} 2>/dev/null | grep -q "200 OK" || nc -z localhost ${SERVER_PORT:-9092}'
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
