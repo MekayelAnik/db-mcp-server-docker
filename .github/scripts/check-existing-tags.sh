@@ -15,8 +15,27 @@ if [[ "$FORCE_BUILD" == "true" ]]; then
     exit 0
 fi
 
-# Check GHCR for existing image via docker manifest inspect
-if docker manifest inspect "${GHCR_REPO}:${VERSION}" >/dev/null 2>&1; then
+# Check if image exists: anonymous first, then authenticated fallback.
+# This ensures read-only checks work even if registry credentials are
+# misconfigured, since GHCR public images are readable without auth.
+image_exists=false
+
+if command -v crane >/dev/null 2>&1; then
+    # Anonymous first (DOCKER_CONFIG=/dev/null ignores stored credentials)
+    if DOCKER_CONFIG=/dev/null crane digest "${GHCR_REPO}:${VERSION}" >/dev/null 2>&1; then
+        image_exists=true
+    # Authenticated fallback (uses docker login credentials)
+    elif crane digest "${GHCR_REPO}:${VERSION}" >/dev/null 2>&1; then
+        image_exists=true
+    fi
+else
+    # docker manifest inspect uses whatever auth is configured
+    if docker manifest inspect "${GHCR_REPO}:${VERSION}" >/dev/null 2>&1; then
+        image_exists=true
+    fi
+fi
+
+if [[ "$image_exists" == "true" ]]; then
     echo "Image version already present in GHCR; skipping build"
     echo "skip_build=true"
     exit 0
