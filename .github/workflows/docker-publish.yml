@@ -734,8 +734,9 @@ jobs:
           # Build [{version, platform, platform_slug, runner}, ...]
           ACTION_RUNNER="${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-24.04' }}"
           ARM_RUNNER="${ACTION_RUNNER}-arm"
+          RISCV_RUNNER="${ACTION_RUNNER}-riscv"
           PLATFORM_JSON=$(echo "$PLATFORMS" | jq -Rc 'split(",")')
-          MATRIX=$(echo "$VERSIONS" | jq -c --argjson plats "$PLATFORM_JSON" --arg arm_runner "$ARM_RUNNER" --arg amd_runner "$ACTION_RUNNER" '
+          MATRIX=$(echo "$VERSIONS" | jq -c --argjson plats "$PLATFORM_JSON" --arg arm_runner "$ARM_RUNNER" --arg amd_runner "$ACTION_RUNNER" --arg riscv_runner "$RISCV_RUNNER" '
             . as $vers |
             [
               $vers[] as $v |
@@ -744,7 +745,7 @@ jobs:
                 version: $v,
                 platform: $p,
                 platform_slug: ($p | gsub("/"; "-")),
-                runner: (if $p == "linux/amd64" then $amd_runner else $arm_runner end)
+                runner: (if $p == "linux/amd64" then $amd_runner elif $p == "linux/riscv64" then $riscv_runner else $arm_runner end)
               }
             ]
           ')
