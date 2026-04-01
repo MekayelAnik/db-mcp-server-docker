@@ -4,10 +4,31 @@
     "config:recommended",
     ":configMigration"
   ],
+  "enabledManagers": [
+    "github-actions",
+    "custom.regex"
+  ],
   "pinDigests": false,
+  "github-actions": {
+    "fileMatch": [
+      "(^|/).github/workflows/[^/]+\\.ya?ml$",
+      "(^|/).github/actions/[^/]+/action\\.ya?ml$"
+    ]
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track crane (go-containerregistry) pinned fallback versions",
+      "fileMatch": [".github/actions/setup-build-env/action\\.yml$"],
+      "matchStrings": ["CRANE_FALLBACK_VERSIONS=\\(\"(?<currentValue>v[\\d.]+)\""],
+      "depNameTemplate": "google/go-containerregistry",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
   "labels": [
     "dependencies",
-    "automated"
+    "automated",
+    "github-actions"
   ],
   "assignees": [
     "mekayelanik"
@@ -26,7 +47,7 @@
   "rebaseWhen": "behind-base-branch",
   "prConcurrentLimit": 10,
   "prHourlyLimit": 5,
-  "minimumReleaseAge": "7 days",
+  "minimumReleaseAge": "0 days",
   "internalChecksFilter": "strict",
   "osvVulnerabilityAlerts": true,
   "vulnerabilityAlerts": {
@@ -46,7 +67,7 @@
       "enabled": false
     },
     {
-      "description": "GitHub Actions — major versions only (e.g. @v4 → @v5). Disable minor/patch updates.",
+      "description": "GitHub Actions: major versions only; disable minor/patch",
       "matchManagers": [
         "github-actions"
       ],
@@ -57,146 +78,21 @@
       "enabled": false
     },
     {
-      "description": "GitHub Actions — major updates with automerge when mergeable",
+      "description": "GitHub Actions: major updates as PRs",
       "matchManagers": [
         "github-actions"
       ],
       "matchUpdateTypes": [
         "major"
       ],
-      "automerge": true,
-      "minimumReleaseAge": "7 days"
-    },
-    {
-      "description": "Security-related actions — major only, high priority",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "groupName": "security-actions",
-      "prPriority": 10,
-      "labels": [
-        "dependencies",
-        "github-actions",
-        "security",
-        "priority"
-      ],
-      "matchPackageNames": [
-        "/^aquasecurity\\//",
-        "/^securego\\//",
-        "/^github\\/codeql/"
-      ]
-    },
-    {
-      "description": "Core GitHub Actions (checkout, setup, upload/download) — major only",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "groupName": "github-core-actions",
-      "prPriority": 5,
-      "labels": [
-        "dependencies",
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "/^actions\\//"
-      ]
-    },
-    {
-      "description": "Docker ecosystem actions — major only",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "groupName": "docker-actions",
-      "prPriority": 3,
-      "labels": [
-        "dependencies",
-        "github-actions",
-        "docker"
-      ],
-      "matchPackageNames": [
-        "/^docker\\//"
-      ]
-    },
-    {
-      "description": "All other GitHub Actions — major only",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "groupName": "other-github-actions",
-      "prPriority": 1,
-      "labels": [
-        "dependencies",
-        "github-actions"
-      ],
-      "matchPackageNames": [
-        "!/^actions\\//",
-        "!/^docker\\//",
-        "!/^aquasecurity\\//",
-        "!/^securego\\//",
-        "!/^github\\/codeql/"
-      ]
-    },
-    {
-      "description": "Dockerfile base images — grouped PR with automerge when mergeable",
-      "matchManagers": [
-        "dockerfile"
-      ],
-      "groupName": "dockerfile-base-images",
-      "prPriority": 4,
-      "automerge": true,
-      "labels": [
-        "dependencies",
-        "docker",
-        "dockerfile"
-      ],
-      "matchPackageNames": [
-        "golang",
-        "alpine",
-        "tonistiigi/xx"
-      ]
-    },
-    {
-      "description": "Automerge minor and patch for non-actions, non-dockerfile stable packages",
-      "matchManagers": [
-        "!github-actions",
-        "!dockerfile"
-      ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch"
-      ],
-      "matchCurrentVersion": "!/^0/",
       "automerge": true,
       "automergeType": "pr",
-      "automergeStrategy": "squash"
-    }
-  ],
-  "customManagers": [
-    {
-      "description": "Track upstream FreePeak/db-mcp-server repo for new commits — triggers workflow dispatch on new main branch SHA",
-      "customType": "regex",
-      "managerFilePatterns": [
-        "/^\\.github/workflows/docker-publish\\.yml$/"
+      "automergeStrategy": "squash",
+      "labels": [
+        "dependencies",
+        "github-actions"
       ],
-      "matchStrings": [
-        "UPSTREAM_REPO_SHA:\\s*(?<currentValue>[a-f0-9]{40})"
-      ],
-      "depNameTemplate": "FreePeak/db-mcp-server",
-      "packageNameTemplate": "https://github.com/FreePeak/db-mcp-server",
-      "datasourceTemplate": "git-refs",
-      "versioningTemplate": "git"
+      "groupName": "github-actions-major"
     }
   ],
   "commitMessagePrefix": "ci: ",
