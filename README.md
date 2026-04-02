@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://hub.docker.com/r/mekayelanik/db-mcp-server"><img alt="Docker Pulls" src="https://img.shields.io/docker/pulls/mekayelanik/db-mcp-server?style=flat-square&logo=docker"></a>
   <a href="https://hub.docker.com/r/mekayelanik/db-mcp-server"><img alt="Docker Stars" src="https://img.shields.io/docker/stars/mekayelanik/db-mcp-server?style=flat-square&logo=docker"></a>
-  <a href="https://github.com/mekayelanik/db-mcp-server-docker/pkgs/container/db-mcp-server"><img alt="GHCR" src="https://img.shields.io/badge/GHCR-ghcr.io%2Fmekayelanik%2Fdb-mcp-server-blue?style=flat-square&logo=github"></a>
-  <a href="https://github.com/mekayelanik/db-mcp-server-docker/blob/main/LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square"></a>
+  <a href="https://github.com/MekayelAnik/db-mcp-server-docker/pkgs/container/db-mcp-server"><img alt="GHCR" src="https://img.shields.io/badge/GHCR-ghcr.io%2Fmekayelanik%2Fdb-mcp-server-blue?style=flat-square&logo=github"></a>
+  <a href="https://github.com/MekayelAnik/db-mcp-server-docker/blob/main/LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/License-GPL--3.0-blue?style=flat-square"></a>
   <a href="https://hub.docker.com/r/mekayelanik/db-mcp-server"><img alt="Platforms" src="https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64-lightgrey?style=flat-square"></a>
   <a href="https://github.com/MekayelAnik/db-mcp-server-docker/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/MekayelAnik/db-mcp-server-docker?style=flat-square"></a>
   <a href="https://github.com/MekayelAnik/db-mcp-server-docker/forks"><img alt="GitHub Forks" src="https://img.shields.io/github/forks/MekayelAnik/db-mcp-server-docker?style=flat-square"></a>
@@ -25,8 +25,8 @@
 [![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fmekayelanik%2Fdb--mcp--server-blue?logo=github)](https://ghcr.io/mekayelanik/db-mcp-server)
 [![Platforms](https://img.shields.io/badge/Platforms-amd64%20%7C%20arm64%20%7C%20arm%2Fv7-lightgrey?logo=linuxcontainers)](https://hub.docker.com/r/mekayelanik/db-mcp-server)
 [![Go Version](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
-[![Build Status](https://img.shields.io/github/actions/workflow/status/mekayelanik/db-mcp-server-docker/docker-publish.yml?branch=main&logo=githubactions&logoColor=white&label=Build)](https://github.com/mekayelanik/db-mcp-server-docker/actions/workflows/docker-publish.yml)
-[![Last Commit](https://img.shields.io/github/last-commit/mekayelanik/db-mcp-server-docker?logo=github&logoColor=white)](https://github.com/mekayelanik/db-mcp-server-docker/commits/main)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/mekayelanik/db-mcp-server-docker/docker-publish.yml?branch=main&logo=githubactions&logoColor=white&label=Build)](https://github.com/MekayelAnik/db-mcp-server-docker/actions/workflows/docker-publish.yml)
+[![Last Commit](https://img.shields.io/github/last-commit/mekayelanik/db-mcp-server-docker?logo=github&logoColor=white)](https://github.com/MekayelAnik/db-mcp-server-docker/commits/main)
 
 <h3>Unofficial multi-arch Up-to-Date Docker image for <a href="https://github.com/FreePeak/db-mcp-server">FreePeak/db-mcp-server</a> — a powerful multi-database MCP server for AI assistants.</h3>
 
