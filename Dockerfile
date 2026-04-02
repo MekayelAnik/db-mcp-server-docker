@@ -12,7 +12,7 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0 AS xx
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
 # Always runs on the native build platform (amd64 in CI), cross-compiles output
-FROM --platform=$BUILDPLATFORM golang:latest-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:alpine AS builder
 
 # Copy xx tools into the builder
 COPY --from=xx / /
