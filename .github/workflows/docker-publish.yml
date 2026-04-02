@@ -1132,7 +1132,6 @@ jobs:
           path: /tmp/digests
           pattern: digest-${{ matrix.version }}-*
           merge-multiple: true
-          if-no-files-found: warn
 
       - name: Determine image tags
         id: tags
