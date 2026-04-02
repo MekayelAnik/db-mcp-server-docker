@@ -82,7 +82,6 @@ Stable promotion is available through workflow actions:
 ---
 
 ## 😎 Buy Me a Coffee ☕︎
-
 **Your support encourages me to keep creating/supporting my open-source projects.** If you found value in this project, you can buy me a coffee to keep me inspired.
 
 <p align="center">
@@ -974,11 +973,10 @@ Built on top of [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-serv
 ---
 
 ## 😎 Buy Me a Coffee ☕︎
-
 **Your support encourages me to keep creating/supporting my open-source projects.** If you found value in this project, you can buy me a coffee to keep me inspired.
 
 <p align="center">
-<a href="https://07mekayel07.gumroad.com/coffee" target="_blank">
-<img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
-</a>
+  <a href="https://07mekayel07.gumroad.com/coffee" target="_blank">
+    <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
+  </a>
 </p>

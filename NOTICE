@@ -1,0 +1,10 @@
+This Docker image packages the following third-party software:
+
+db-mcp-server
+  - Source: https://github.com/FreePeak/db-mcp-server
+  - License: MIT
+  - Copyright: FreePeak
+
+HAProxy
+  - Source: https://www.haproxy.org/
+  - License: GPL v2

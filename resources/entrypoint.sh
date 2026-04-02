@@ -11,6 +11,7 @@ readonly DEFAULT_HTTP_VERSION_MODE="auto"
 readonly SAFE_API_KEY_REGEX='^[[:graph:]]+$'
 readonly MIN_API_KEY_LEN=5
 readonly MAX_API_KEY_LEN=256
+readonly HAPROXY_SERVER_NAME="dbmcp"
 readonly HAPROXY_TEMPLATE="/etc/haproxy/haproxy.cfg.template"
 readonly HAPROXY_CONFIG="/tmp/haproxy.cfg"
 readonly DEFAULT_PUID=1000
@@ -344,9 +345,41 @@ escape_haproxy_regex() {
   printf '%s' "$escaped"
 }
 
+validate_cors() {
+  ALLOW_ALL_CORS=false
+  HAPROXY_CORS_ENABLED=false
+  HAPROXY_CORS_ORIGINS=()
+
+  local cors_value
+  if [[ -z "${CORS:-}" ]]; then
+    return
+  fi
+
+  HAPROXY_CORS_ENABLED=true
+  IFS=',' read -ra CORS_VALUES <<< "$CORS"
+  for cors_value in "${CORS_VALUES[@]}"; do
+    cors_value="$(trim "$cors_value")"
+    [[ -z "$cors_value" ]] && continue
+
+    if [[ "$cors_value" =~ ^(all|\*)$ ]]; then
+      ALLOW_ALL_CORS=true
+      HAPROXY_CORS_ORIGINS=("*")
+      break
+    elif [[ "$cors_value" =~ ^https?:// ]]; then
+      HAPROXY_CORS_ORIGINS+=("$cors_value")
+    elif [[ "$cors_value" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(:[0-9]+)?$ ]]; then
+      HAPROXY_CORS_ORIGINS+=("http://$cors_value" "https://$cors_value")
+    elif [[ "$cors_value" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?$ ]]; then
+      HAPROXY_CORS_ORIGINS+=("http://$cors_value" "https://$cors_value")
+    else
+      echo "Warning: Invalid CORS pattern '$cors_value' - skipping"
+    fi
+  done
+}
+
 generate_haproxy_config() {
   if [[ ! -f "$HAPROXY_TEMPLATE" ]]; then
-    echo "HAProxy template missing: $HAPROXY_TEMPLATE"
+    echo "Error: HAProxy template missing at ${HAPROXY_TEMPLATE}" >&2
     exit 1
   fi
 
@@ -373,27 +406,58 @@ generate_haproxy_config() {
     api_key_check="    # API Key authentication disabled - all requests allowed"
   fi
 
-  local escaped_bind_directive
-    escaped_bind_directive="$(escape_sed_replacement "${BIND_PARAMS}")"
-    local escaped_quic_bind_line
-    escaped_quic_bind_line="$(escape_sed_replacement "${QUIC_BIND_LINE}")"
+  local cors_check
+  local cors_preflight_condition
+  local cors_response_condition
 
-    sed -e "s|__SERVER_PORT__|${SERVER_PORT}|g" \
-      -e "s|__BIND_PARAMS__|${escaped_bind_directive}|g" \
+  if [[ "$HAPROXY_CORS_ENABLED" == "true" ]]; then
+    if [[ "$ALLOW_ALL_CORS" == "true" ]]; then
+      cors_check="    # CORS enabled - allowing ALL origins"
+      cors_preflight_condition="{ var(txn.origin) -m found }"
+      cors_response_condition="{ var(txn.origin) -m found }"
+    else
+      cors_check="    # CORS enabled - allowing specific origins
+    acl cors_origin_allowed var(txn.origin) -m str -i"
+
+      local origin
+      for origin in "${HAPROXY_CORS_ORIGINS[@]}"; do
+        cors_check+=" ${origin}"
+      done
+
+      cors_check+="
+
+    # Deny requests from non-allowed origins
+    http-request deny deny_status 403 content-type \"application/json\" string '{\"error\":\"Forbidden\",\"message\":\"Origin not allowed\"}' if { var(txn.origin) -m found } !cors_origin_allowed"
+      cors_preflight_condition="cors_origin_allowed"
+      cors_response_condition="cors_origin_allowed"
+    fi
+  else
+    cors_check="    # CORS disabled"
+    cors_preflight_condition="{ always_false }"
+    cors_response_condition="{ always_false }"
+  fi
+
+  local escaped_bind_params
+  local escaped_quic_bind_line
+  escaped_bind_params="$(escape_sed_replacement "$BIND_PARAMS")"
+  escaped_quic_bind_line="$(escape_sed_replacement "$QUIC_BIND_LINE")"
+
+  sed -e "s|__SERVER_PORT__|${SERVER_PORT}|g" \
+      -e "s|__BIND_PARAMS__|${escaped_bind_params}|g" \
       -e "s|__QUIC_BIND_LINE__|${escaped_quic_bind_line}|g" \
       -e "s|__INTERNAL_PORT__|${INTERNAL_SERVER_PORT}|g" \
-      -e "s|__SERVER_NAME__|dbmcp|g" \
-      -e "s|__CORS_PREFLIGHT_CONDITION__|{ always_false }|g" \
-      -e "s|__CORS_RESPONSE_CONDITION__|{ always_false }|g" \
+      -e "s|__SERVER_NAME__|${HAPROXY_SERVER_NAME}|g" \
+      -e "s|__CORS_PREFLIGHT_CONDITION__|${cors_preflight_condition}|g" \
+      -e "s|__CORS_RESPONSE_CONDITION__|${cors_response_condition}|g" \
       "$HAPROXY_TEMPLATE" > "${HAPROXY_CONFIG}.tmp"
 
-  awk -v replacement="$api_key_check" '
+  awk -v replacement="$api_key_check" -v replacement_cors="$cors_check" '
     /__API_KEY_CHECK__/ {
       print replacement
       next
     }
     /__CORS_CHECK__/ {
-      print "    # CORS disabled"
+      print replacement_cors
       next
     }
     { print }
@@ -461,6 +525,7 @@ main() {
   TLS_DAYS="${TLS_DAYS:-$DEFAULT_TLS_DAYS}"
   TLS_MIN_VERSION="${TLS_MIN_VERSION:-$DEFAULT_TLS_MIN_VERSION}"
   HTTP_VERSION_MODE="${HTTP_VERSION_MODE:-$DEFAULT_HTTP_VERSION_MODE}"
+  CORS="${CORS:-}"
 
   SERVER_PORT="$(validate_port "SERVER_PORT" "$SERVER_PORT" "$DEFAULT_PORT")"
   INTERNAL_SERVER_PORT="$(validate_port "INTERNAL_SERVER_PORT" "$INTERNAL_SERVER_PORT" "$DEFAULT_INTERNAL_PORT")"
@@ -469,6 +534,7 @@ main() {
   HTTP_VERSION_MODE="$(normalize_http_version_mode "$HTTP_VERSION_MODE")"
 
   validate_api_key
+  validate_cors
 
   PUID="${PUID:-$DEFAULT_PUID}"
   PGID="${PGID:-$DEFAULT_PGID}"
@@ -478,6 +544,10 @@ main() {
   if [[ ! -f "$FIRST_RUN_FILE" ]]; then
     handle_first_run
   fi
+
+  # Export variables for banner.sh (runs as child process)
+  export SERVER_PORT PUID PGID
+  /usr/local/bin/banner.sh 2>/dev/null || true
 
   if is_true "$ENABLE_HTTPS"; then
     prepare_tls_pem "$TLS_CERT_PATH" "$TLS_KEY_PATH" "$TLS_PEM_PATH" "$TLS_DAYS" "$TLS_CN" "$TLS_SAN"
@@ -502,8 +572,12 @@ main() {
     echo "HTTPS enabled on port ${SERVER_PORT}"
     echo "HTTP versions enabled: ${EFFECTIVE_HTTP_VERSIONS}"
   else
-    echo "HTTPS disabled; serving HTTP on port ${SERVER_PORT}"
-    echo "HTTP versions enabled: h1"
+    echo "HTTPS disabled; listening on HTTP port ${SERVER_PORT}"
+    echo "WARNING: Traffic is NOT encrypted when ENABLE_HTTPS=false." >&2
+    echo "WARNING: Use ENABLE_HTTPS=true for internet-facing or untrusted networks." >&2
+    if [[ -n "$API_KEY" ]]; then
+      echo "WARNING: API_KEY protects access but does not encrypt HTTP traffic." >&2
+    fi
   fi
 
   wait -n "$SERVER_PID" "$HAPROXY_PID"

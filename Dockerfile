@@ -12,7 +12,7 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.9.0 AS xx
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
 # Always runs on the native build platform (amd64 in CI), cross-compiles output
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:latest-alpine AS builder
 
 # Copy xx tools into the builder
 COPY --from=xx / /
@@ -70,17 +70,19 @@ WORKDIR /app
 
 COPY --from=builder /app/bin/server /app/server
 COPY config.json /app/config.json
-COPY haproxy.cfg.template /etc/haproxy/haproxy.cfg.template
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-
-RUN mkdir -p /app/data /app/logs \
-  && chmod +x /usr/local/bin/docker-entrypoint.sh
+COPY ./resources/ /usr/local/bin/
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/banner.sh \
+    && if [ -f /usr/local/bin/build-timestamp.txt ]; then chmod +r /usr/local/bin/build-timestamp.txt; fi \
+    && mkdir -p /etc/haproxy \
+    && mv -vf /usr/local/bin/haproxy.cfg.template /etc/haproxy/haproxy.cfg.template \
+    && mkdir -p /app/data /app/logs
 
 ENV SERVER_PORT=9092
 ENV INTERNAL_SERVER_PORT=38011
 ENV TRANSPORT_MODE=sse
 ENV CONFIG_PATH=/app/config.json
 ENV API_KEY=
+ENV CORS=
 ENV ENABLE_HTTPS=true
 ENV TLS_CERT_PATH=/etc/haproxy/certs/server.crt
 ENV TLS_KEY_PATH=/etc/haproxy/certs/server.key
@@ -102,4 +104,4 @@ VOLUME ["/app/logs"]
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD nc -z 127.0.0.1 ${SERVER_PORT:-9092}
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
