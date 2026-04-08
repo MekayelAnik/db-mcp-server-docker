@@ -1612,7 +1612,8 @@ jobs:
     needs: [check-releases, merge-manifest, sync-registries]
     if: |
       always() &&
-      needs.merge-manifest.result == 'success'
+      needs.merge-manifest.result == 'success' &&
+      (needs.sync-registries.result == 'success' || needs.sync-registries.result == 'skipped')
 
     permissions:
       contents: write
