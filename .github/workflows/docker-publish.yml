@@ -1108,12 +1108,36 @@ jobs:
         version: ${{ fromJson(needs.check-releases.outputs.versions_json) }}
 
     steps:
+      - name: Download all platform digests for this version
+        id: download-digests
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.version }}-*
+          merge-multiple: true
+
+      - name: Check if merge is needed
+        id: check-digests
+        shell: bash
+        run: |
+          if [[ -d /tmp/digests ]] && ls /tmp/digests/* >/dev/null 2>&1; then
+            echo "has_digests=true" >> "$GITHUB_OUTPUT"
+            echo "Found digests to merge:"
+            ls -la /tmp/digests/
+          else
+            echo "has_digests=false" >> "$GITHUB_OUTPUT"
+            echo "No digests found — all builds were skipped (tags already exist)"
+          fi
+
       - name: Checkout
+        if: steps.check-digests.outputs.has_digests == 'true'
         uses: actions/checkout@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup build environment
+        if: steps.check-digests.outputs.has_digests == 'true'
         uses: ./.github/actions/setup-build-env
         with:
           do_checkout: 'false'
@@ -1126,14 +1150,8 @@ jobs:
           ghcr_actor: ${{ github.actor }}
           ghcr_token: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
-      - name: Download all platform digests for this version
-        uses: actions/download-artifact@v8
-        with:
-          path: /tmp/digests
-          pattern: digest-${{ matrix.version }}-*
-          merge-multiple: true
-
       - name: Determine image tags
+        if: steps.check-digests.outputs.has_digests == 'true'
         id: tags
         run: |
           DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
@@ -1181,13 +1199,13 @@ jobs:
       # ── Docker Hub manifest (with retry — mirrors merge job in docker-build.yml) ──
       - name: Create Docker Hub multi-arch manifest
         id: dockerhub-manifest
-        if: github.event.inputs.push_to_dockerhub != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.push_to_dockerhub != 'false'
         run: |
           SOURCE_REPO="${{ env.GHCR_REPO }}"
           if [[ "${{ github.event.inputs.push_to_ghcr || 'true' }}" != "true" ]]; then
             SOURCE_REPO="${{ env.DOCKERHUB_REPO }}"
           fi
-          SOURCES=$(for f in /tmp/digests/*; do echo "${SOURCE_REPO}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${SOURCE_REPO}@sha256:$(basename $f)"; done | tr '\n' ' ')
           SUCCESS=0
           RATE_LIMITED=0
 
@@ -1219,9 +1237,9 @@ jobs:
 
       # ── GHCR manifest (with retry) ─────────────────────────────────────────
       - name: Create GHCR multi-arch manifest
-        if: github.event.inputs.push_to_ghcr != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.push_to_ghcr != 'false'
         run: |
-          SOURCES=$(for f in /tmp/digests/*; do echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+          SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
             docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES && break
@@ -1229,6 +1247,7 @@ jobs:
           done
 
       - name: Inspect final manifest
+        if: steps.check-digests.outputs.has_digests == 'true'
         run: |
           if [[ "${{ github.event.inputs.push_to_dockerhub || 'true' }}" == "true" && "${{ steps.dockerhub-manifest.outputs.status }}" == "success" ]]; then
             docker buildx imagetools inspect ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}
@@ -1240,7 +1259,7 @@ jobs:
       # ── Trivy security scan (non-blocking) ────────────────────────────────
       - name: Trivy vulnerability scan
         id: trivy-scan
-        if: github.event.inputs.run_security_scan != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.run_security_scan != 'false'
         uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: '${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}'
@@ -1253,6 +1272,7 @@ jobs:
       - name: Upload Trivy SARIF results
         # Only upload if scan actually produced a file — skips when Trivy install fails
         if: >
+          steps.check-digests.outputs.has_digests == 'true' &&
           github.event.inputs.run_security_scan != 'false' &&
           steps.trivy-scan.outcome == 'success' &&
           hashFiles(format('trivy-{0}.sarif', matrix.version)) != ''
@@ -1263,6 +1283,7 @@ jobs:
         continue-on-error: true
 
       - name: Merge summary
+        if: steps.check-digests.outputs.has_digests == 'true'
         run: |
           {
             echo "## ✅ Build Complete: ${{ steps.tags.outputs.primary_tag }}"
@@ -1286,6 +1307,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload build artifacts
+        if: steps.check-digests.outputs.has_digests == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: build-info-${{ matrix.version }}
