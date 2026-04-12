@@ -996,7 +996,7 @@ jobs:
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v7
+        uses: ./.github/actions/build-push-retry
         timeout-minutes: ${{ fromJSON(needs.check-releases.outputs.build_timeout_min) }}
         with:
           context: ./upstream
