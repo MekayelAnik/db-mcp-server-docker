@@ -817,7 +817,7 @@ jobs:
 
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 20
       matrix:
         include: ${{ fromJson(needs.check-releases.outputs.build_matrix) }}
 
