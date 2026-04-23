@@ -428,42 +428,36 @@ jobs:
             echo ""
           }
 
-          # Check :latest on both registries — compare their revision label to HEAD SHA
-          DH_REF="${{ env.DOCKERHUB_REPO }}:latest"
+          # Check :latest on GHCR only — matches the rest of the fleet.
+          # Docker Hub is authoritative for *publishing* but not for lookups;
+          # inspecting DH manifests counts against the 200/6h anon pull quota
+          # and produces 429s on large batch builds. GHCR has no such limit
+          # for authenticated callers. registry-sync handles DH↔GHCR parity.
           GC_REF="${{ env.GHCR_REPO }}:latest"
-
-          DH_SHA=$(get_revision "$DH_REF")
           GC_SHA=$(get_revision "$GC_REF")
 
-          echo "Docker Hub :latest revision = '${DH_SHA:-<not found>}'"
-          echo "GHCR       :latest revision = '${GC_SHA:-<not found>}'"
+          echo "GHCR :latest revision = '${GC_SHA:-<not found>}'"
 
-          # An image is "current" if its revision label matches HEAD SHA exactly
-          DH_CURRENT="false"; GC_CURRENT="false"
-          [[ "$DH_SHA" == "$CURRENT_SHA" ]] && DH_CURRENT="true"
+          GC_CURRENT="false"
           [[ "$GC_SHA" == "$CURRENT_SHA" ]] && GC_CURRENT="true"
-
-          # Also expose existence (for downstream steps that still need it)
-          # Re-use the revision data — if we got a revision, the image exists
-          DH_EXISTS=$([[ -n "$DH_SHA" ]] && echo exists || echo missing)
           GC_EXISTS=$([[ -n "$GC_SHA" ]] && echo exists || echo missing)
 
-          echo "dockerhub_status=$DH_EXISTS"   >> "$GITHUB_OUTPUT"
-          echo "ghcr_status=$GC_EXISTS"        >> "$GITHUB_OUTPUT"
-          echo "dockerhub_current=$DH_CURRENT" >> "$GITHUB_OUTPUT"
-          echo "ghcr_current=$GC_CURRENT"      >> "$GITHUB_OUTPUT"
-          echo "head_sha=$CURRENT_SHA"         >> "$GITHUB_OUTPUT"
-          echo "head_sha_short=sha-$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          # Keep the dockerhub_* outputs for backward compatibility with
+          # downstream steps/summary, but derive them from GHCR. DH state is
+          # reconciled by registry-sync after each successful build.
+          echo "dockerhub_status=$GC_EXISTS"    >> "$GITHUB_OUTPUT"
+          echo "ghcr_status=$GC_EXISTS"         >> "$GITHUB_OUTPUT"
+          echo "dockerhub_current=$GC_CURRENT"  >> "$GITHUB_OUTPUT"
+          echo "ghcr_current=$GC_CURRENT"       >> "$GITHUB_OUTPUT"
+          echo "head_sha=$CURRENT_SHA"          >> "$GITHUB_OUTPUT"
+          echo "head_sha_short=sha-$SHORT_SHA"  >> "$GITHUB_OUTPUT"
 
-          if [[ "$DH_CURRENT" == "true" && "$GC_CURRENT" == "true" ]]; then
+          if [[ "$GC_CURRENT" == "true" ]]; then
             echo "commit_published=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Commit $SHORT_SHA already published to both registries — will SKIP build"
-          elif [[ "$DH_CURRENT" == "true" || "$GC_CURRENT" == "true" ]]; then
-            echo "commit_published=partial" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Commit $SHORT_SHA published to one registry only — will BUILD for the other"
+            echo "✅ Commit $SHORT_SHA already published to GHCR — will SKIP build"
           else
             echo "commit_published=false" >> "$GITHUB_OUTPUT"
-            echo "🔨 Commit $SHORT_SHA not yet published — will BUILD"
+            echo "🔨 Commit $SHORT_SHA not yet published to GHCR — will BUILD"
           fi
 
       - name: Check base image for updates
@@ -476,11 +470,16 @@ jobs:
             exit 0
           fi
 
-          # Get Dockerfile base image
-          BASE_IMAGE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
+          # Prefer the GHCR-mirrored builder image from BASE_IMAGE_BUILDER env
+          # (set from repo var) — avoids pinging Docker Hub and keeps digests
+          # consistent with what the actual build will pull.
+          BASE_IMAGE="${{ env.BASE_IMAGE_BUILDER }}"
+          if [[ -z "$BASE_IMAGE" ]]; then
+            BASE_IMAGE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
+          fi
           if [[ -z "$BASE_IMAGE" ]]; then
             echo "updated=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Could not determine base image from Dockerfile"
+            echo "⚠️  Could not determine base image"
             exit 0
           fi
           echo "Base image: $BASE_IMAGE"
@@ -488,7 +487,8 @@ jobs:
           BASE_DIGEST=$(skopeo inspect "docker://${BASE_IMAGE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
           echo "Base digest: $BASE_DIGEST"
 
-          CURRENT_IMAGE="${{ env.DOCKERHUB_REPO }}:latest"
+          # Inspect our own :latest on GHCR (not Docker Hub) — no pull-rate limits.
+          CURRENT_IMAGE="${{ env.GHCR_REPO }}:latest"
           CURRENT_BASE=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null \
             | jq -r '.Labels["org.opencontainers.image.base.digest"] // empty' || echo "")
 
@@ -570,11 +570,13 @@ jobs:
               DH_CURRENT="${{ steps.check-existing.outputs.dockerhub_current }}"
               GC_CURRENT="${{ steps.check-existing.outputs.ghcr_current }}"
 
-              # Determine the version label to use for this build
+              # Determine the version label to use for this build.
+              # Look up the current :latest version label on GHCR (not Docker Hub)
+              # to avoid manifest-GET pull-rate limits.
               if [[ -n "$GIT_TAG_VERSION" ]]; then
                 BUILD_VER="$GIT_TAG_VERSION"
               else
-                BUILD_VER=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+                BUILD_VER=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
                   | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
                 [[ -z "$BUILD_VER" ]] && BUILD_VER="latest-from-source"
               fi
@@ -613,8 +615,9 @@ jobs:
               INPUT="${{ github.event.inputs.versions }}"
               if [[ -z "$INPUT" ]]; then
                 if [[ "$FORCE" == "true" ]]; then
-                  # Force build without explicit versions: resolve current version from registry
-                  INPUT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:latest" 2>/dev/null \
+                  # Force build without explicit versions: resolve current version from GHCR
+                  # (Docker Hub inspection is rate-limited; GHCR is not).
+                  INPUT=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
                     | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
                   [[ -z "$INPUT" ]] && INPUT="latest-from-source"
                   echo "⚡ Force build: no versions specified, using '$INPUT'"
@@ -650,10 +653,13 @@ jobs:
               for ver in "${ARR[@]}"; do
                 ver=$(echo "$ver" | xargs)
                 if [[ "$SKIP_EXISTING" == "true" && "$FORCE" != "true" ]]; then
-                  DH=$(rl_inspect "${{ env.DOCKERHUB_REPO }}:${ver}")
+                  # Check GHCR only — matches the rest of the fleet.
+                  # registry-sync reconciles Docker Hub after each successful
+                  # build, so GHCR presence is the authoritative "already built"
+                  # signal and avoids Hub manifest-GET rate limits.
                   GC=$(rl_inspect "${{ env.GHCR_REPO }}:${ver}")
-                  if [[ "$DH" == "yes" && "$GC" == "yes" ]]; then
-                    echo "::notice::Skipping $ver — already in both registries"
+                  if [[ "$GC" == "yes" ]]; then
+                    echo "::notice::Skipping $ver — already in GHCR"
                     continue
                   fi
                 fi
@@ -1307,12 +1313,12 @@ jobs:
       - name: Inspect final manifest
         if: steps.check-digests.outputs.has_digests == 'true'
         run: |
-          if [[ "${{ github.event.inputs.push_to_dockerhub || 'true' }}" == "true" && "${{ steps.dockerhub-manifest.outputs.status }}" == "success" ]]; then
-            docker buildx imagetools inspect ${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}
-          else
-            echo "Docker Hub manifest unavailable or skipped; inspecting GHCR instead."
-            docker buildx imagetools inspect ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}
-          fi
+          # Always inspect on GHCR. GHCR has no pull-rate limits for
+          # authenticated callers; Docker Hub's 200/6h anon (5000/6h auth)
+          # window is trivially blown on large matrix builds and produces
+          # 429 "toomanyrequests" on what is only a verification step.
+          # The manifests are identical across both registries post-push.
+          docker buildx imagetools inspect ${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}
 
       # ── Trivy security scan (non-blocking) ────────────────────────────────
       - name: Trivy vulnerability scan
@@ -1320,7 +1326,7 @@ jobs:
         if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.run_security_scan != 'false'
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: '${{ env.DOCKERHUB_REPO }}:${{ steps.tags.outputs.primary_tag }}'
+          image-ref: '${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}'
           format: sarif
           output: 'trivy-${{ matrix.version }}.sarif'
           severity: 'CRITICAL,HIGH'
@@ -1564,20 +1570,16 @@ jobs:
             exit 0
           fi
 
-          # Check GHCR stable
+          # Check GHCR :stable digest — authoritative source.
+          # Docker Hub is not inspected here (rate limits); the downstream
+          # skopeo_copy_rl step will push to Docker Hub regardless. If GHCR
+          # already points at $TARGET, Docker Hub will be synced by the copy
+          # step in a follow-up run, or via the existing registry-sync path.
           GHCR_STABLE=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:stable" 2>/dev/null \
             | jq -r '.Digest' || echo "none")
 
-          # Check DH stable (rate-limit tolerant)
-          DH_STABLE="none"
-          if DH_OUT=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/tmp/rl_err); then
-            DH_STABLE=$(echo "$DH_OUT" | jq -r '.Digest' || echo "none")
-          elif grep -qiE '429|toomanyrequests|rate limit' /tmp/rl_err; then
-            echo "::warning::Docker Hub rate limited during stable check"
-          fi
-
-          if [[ "$GHCR_STABLE" == "$TARGET" && "$DH_STABLE" == "$TARGET" ]]; then
-            echo "stable already points to $STABLE_VERSION on both registries — nothing to do"
+          if [[ "$GHCR_STABLE" == "$TARGET" ]]; then
+            echo "stable already points to $STABLE_VERSION on GHCR — nothing to do"
             exit 0
           fi
 
