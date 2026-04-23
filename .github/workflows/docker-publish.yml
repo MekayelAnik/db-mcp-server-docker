@@ -170,6 +170,12 @@ env:
   # Comma-separated list of versions to exclude from builds (e.g. "1.7.0,1.8.0")
   EXCLUDE_VERSIONS: ${{ vars.EXCLUDE_VERSIONS || '' }}
   HAPROXY_IMAGE: ${{ vars.HAPROXY_IMAGE || 'haproxy:lts-alpine' }}
+  # Base images (GHCR mirrors preferred to avoid Docker Hub rate limits).
+  # Each is crane-probed at build time; if unreachable, the Docker Hub
+  # short-name is used as fallback.
+  BASE_IMAGE_BUILDER: ${{ vars.BASE_IMAGE_BUILDER || 'golang:alpine' }}
+  BASE_IMAGE_RUNTIME: ${{ vars.BASE_IMAGE_RUNTIME || 'alpine:latest' }}
+  XX_IMAGE:           ${{ vars.XX_IMAGE           || 'tonistiigi/xx:master' }}
 
   # ── Upstream source tracking ──────────────────────────────────────────────
   # Renovate watches this SHA and opens a PR when FreePeak/db-mcp-server
@@ -977,21 +983,73 @@ jobs:
           echo "Version:     ${{ matrix.version }}"
           echo "Timeout:     ${{ needs.check-releases.outputs.build_timeout_min }}min"
 
-      # ── Resolve HAProxy image (GHCR mirror with Docker Hub fallback) ───────
-      - name: Resolve HAProxy image
-        id: haproxy
+      # ── Resolve base images (GHCR mirrors with Docker Hub fallback) ───────
+      # Swap every FROM in ./Dockerfile that has a mirrored counterpart.
+      # Each candidate is probed with `docker buildx imagetools inspect`; if the
+      # GHCR mirror is unreachable, the original Docker Hub short name is kept.
+      # This drastically cuts Docker Hub manifest GETs (and thus 429s) on large
+      # matrix builds without breaking local developer builds that have no
+      # access to the GHCR mirror namespace.
+      - name: Resolve base images
+        id: base-images
         run: |
           set -euo pipefail
-          HAPROXY_IMG="${{ env.HAPROXY_IMAGE }}"
-          if ! docker buildx imagetools inspect "$HAPROXY_IMG" >/dev/null 2>&1; then
-            HAPROXY_FALLBACK="${HAPROXY_IMG##*/}"
-            echo "HAProxy image '$HAPROXY_IMG' not available, falling back to '$HAPROXY_FALLBACK'"
-            HAPROXY_IMG="$HAPROXY_FALLBACK"
-          fi
-          echo "Using HAProxy image: $HAPROXY_IMG"
-          # Inject resolved image directly into Dockerfile (avoids ARG before FROM bugs)
-          sed -i "s|FROM haproxy:lts-alpine AS haproxy-src|FROM ${HAPROXY_IMG} AS haproxy-src|" ./Dockerfile
-          echo "image=$HAPROXY_IMG" >> "$GITHUB_OUTPUT"
+
+          resolve_and_swap() {
+            local desired="$1"   # GHCR mirror (or Hub short-name if no mirror var)
+            local pattern="$2"   # regex matching FROM target in Dockerfile
+            local label="$3"     # human label for logs
+
+            if [[ -z "$desired" ]]; then
+              echo "⚠ $label: no image configured, skipping"
+              return 0
+            fi
+
+            local chosen="$desired"
+            if ! docker buildx imagetools inspect "$desired" >/dev/null 2>&1; then
+              local fallback="${desired##*/}"
+              echo "$label: '$desired' unreachable — falling back to Docker Hub '$fallback'"
+              chosen="$fallback"
+            fi
+
+            if grep -qE "$pattern" ./Dockerfile; then
+              # Use | as sed delimiter since image refs contain /
+              sed -i -E "s|$pattern|${chosen}|" ./Dockerfile
+              echo "$label: swapped to $chosen"
+            else
+              echo "$label: pattern '$pattern' not found in Dockerfile — no-op"
+            fi
+          }
+
+          # haproxy-src — matches `FROM haproxy:lts-alpine` or a GHCR mirror tag
+          resolve_and_swap \
+            "${{ env.HAPROXY_IMAGE }}" \
+            'haproxy:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/haproxy:[A-Za-z0-9._-]+' \
+            "HAProxy"
+
+          # builder — golang:alpine (or GHCR mirror)
+          resolve_and_swap \
+            "${{ env.BASE_IMAGE_BUILDER }}" \
+            'golang:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/golang:[A-Za-z0-9._-]+' \
+            "Builder (golang)"
+
+          # runtime — alpine:latest (or GHCR mirror). Match only the 2nd-stage
+          # `FROM alpine:...`; the haproxy-src stage is already replaced above.
+          resolve_and_swap \
+            "${{ env.BASE_IMAGE_RUNTIME }}" \
+            'alpine:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/alpine:[A-Za-z0-9._-]+' \
+            "Runtime (alpine)"
+
+          # xx helper — tonistiigi/xx:<tag> (or GHCR mirror)
+          resolve_and_swap \
+            "${{ env.XX_IMAGE }}" \
+            'tonistiigi/xx:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/tonistiigi/xx:[A-Za-z0-9._-]+' \
+            "xx (cross-compile helper)"
+
+          echo "─── Final FROM lines ──────────────────────────────"
+          grep -nE "^FROM" ./Dockerfile
+          echo "───────────────────────────────────────────────────"
+
 
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
       - name: Build and push by digest
