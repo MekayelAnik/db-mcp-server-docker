@@ -1050,8 +1050,10 @@ jobs:
             fi
 
             if grep -qE "$pattern" ./Dockerfile; then
-              # Use | as sed delimiter since image refs contain /
-              sed -i -E "s|$pattern|${chosen}|" ./Dockerfile
+              # Use # as sed delimiter — image refs never contain '#', and the
+              # pattern uses '|' for ERE alternation so it cannot also be sed's
+              # separator (would be parsed as end-of-search).
+              sed -i -E "s#${pattern}#${chosen}#" ./Dockerfile
               echo "$label: swapped to $chosen"
             else
               echo "$label: pattern '$pattern' not found in Dockerfile — no-op"
