@@ -3,7 +3,9 @@ set -euo pipefail
 
 readonly DEFAULT_PORT=9092
 readonly DEFAULT_INTERNAL_PORT=38011
-readonly DEFAULT_PROTOCOL="sse"
+readonly DEFAULT_PROTOCOL="SHTTP"
+readonly DEFAULT_STATEFUL="true"
+readonly DEFAULT_SESSION_TIMEOUT_MS="3600000"
 readonly DEFAULT_TLS_DAYS=365
 readonly DEFAULT_TLS_CN="localhost"
 readonly DEFAULT_TLS_MIN_VERSION="TLSv1.3"
@@ -467,22 +469,94 @@ generate_haproxy_config() {
 }
 
 start_server() {
-  local protocol="${TRANSPORT_MODE:-$DEFAULT_PROTOCOL}"
   local config_path="${CONFIG_PATH:-/app/config.json}"
 
-  echo "Starting MCP server on internal port ${INTERNAL_SERVER_PORT}"
-  /app/server -t "$protocol" -p "$INTERNAL_SERVER_PORT" -c "$config_path" &
+  # HARD LOCK: inner bridge (supergateway -> Go MCP server) is always stdio.
+  # Client-facing transport (SHTTP/SSE/WS/STDIO) is selected via $PROTOCOL.
+  # If the user sets TRANSPORT_MODE expecting to change the client transport,
+  # it is ignored — that is what PROTOCOL is for.
+  if [[ -n "${TRANSPORT_MODE:-}" && "${TRANSPORT_MODE}" != "stdio" ]]; then
+    echo "INFO: TRANSPORT_MODE='${TRANSPORT_MODE}' ignored — supergateway<->db-mcp-server link is always stdio. Use PROTOCOL (SHTTP|SSE|WS|STDIO) to choose client-facing transport." >&2
+  fi
+  export TRANSPORT_MODE=stdio
+
+  local protocol="${PROTOCOL:-$DEFAULT_PROTOCOL}"
+  protocol="${protocol^^}"
+  local stateful_raw="${STATEFUL:-$DEFAULT_STATEFUL}"
+  local session_timeout_ms="${SESSION_TIMEOUT_MS:-$DEFAULT_SESSION_TIMEOUT_MS}"
+
+  local stateful
+  case "${stateful_raw,,}" in
+    true|1|yes|on)   stateful=true  ;;
+    false|0|no|off)  stateful=false ;;
+    *)
+      echo "ERROR: invalid STATEFUL='${stateful_raw}' (expected true|false)" >&2
+      return 1
+      ;;
+  esac
+
+  if ! is_positive_int "$session_timeout_ms"; then
+    echo "ERROR: invalid SESSION_TIMEOUT_MS='${session_timeout_ms}' (expected positive integer in ms)" >&2
+    return 1
+  fi
+
+  local mcp_server_cmd="/app/server -t stdio -c ${config_path}"
+
+  local stateful_args=()
+  if [[ "$stateful" == "true" ]]; then
+    stateful_args=(--stateful --sessionTimeout "$session_timeout_ms")
+  fi
+
+  local CMD_ARGS=()
+  case "$protocol" in
+    SHTTP)
+      CMD_ARGS=(npx --yes supergateway \
+        --port "$INTERNAL_SERVER_PORT" \
+        --streamableHttpPath /mcp \
+        --outputTransport streamableHttp \
+        --healthEndpoint /healthz \
+        "${stateful_args[@]}" \
+        --stdio "$mcp_server_cmd")
+      ;;
+    SSE)
+      CMD_ARGS=(npx --yes supergateway \
+        --port "$INTERNAL_SERVER_PORT" \
+        --ssePath /sse \
+        --outputTransport sse \
+        --healthEndpoint /healthz \
+        --stdio "$mcp_server_cmd")
+      ;;
+    WS)
+      CMD_ARGS=(npx --yes supergateway \
+        --port "$INTERNAL_SERVER_PORT" \
+        --messagePath /message \
+        --outputTransport ws \
+        --healthEndpoint /healthz \
+        --stdio "$mcp_server_cmd")
+      ;;
+    STDIO)
+      echo "ERROR: PROTOCOL=STDIO is not supported inside this container (HAProxy fronts a TCP port). Use SHTTP|SSE|WS." >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: invalid PROTOCOL='${protocol}' (expected SHTTP|SSE|WS)" >&2
+      return 1
+      ;;
+  esac
+
+  echo "Launching db-mcp-server (stdio) wrapped by supergateway (PROTOCOL=${protocol}, STATEFUL=${stateful}${stateful:+, SESSION_TIMEOUT_MS=${session_timeout_ms}}) on internal port ${INTERNAL_SERVER_PORT}"
+  "${CMD_ARGS[@]}" &
   SERVER_PID=$!
 
   local i=0
   until nc -z 127.0.0.1 "$INTERNAL_SERVER_PORT" >/dev/null 2>&1; do
     if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
-      echo "MCP server exited before becoming ready"
+      echo "supergateway exited before becoming ready"
       return 1
     fi
     i=$((i + 1))
-    if [ "$i" -ge 30 ]; then
-      echo "MCP server did not become ready on ${INTERNAL_SERVER_PORT}"
+    if [ "$i" -ge 60 ]; then
+      echo "supergateway did not become ready on ${INTERNAL_SERVER_PORT}"
       return 1
     fi
     sleep 1

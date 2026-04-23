@@ -5,6 +5,7 @@ REPO_NAME='db-mcp-server'
 GO_IMAGE=$(cat ./build_data/base-image 2>/dev/null || echo "golang:latest-alpine")
 HAPROXY_IMAGE=$(cat ./build_data/haproxy-image 2>/dev/null || echo "haproxy:lts-alpine")
 DB_MCP_VERSION=$(cat ./build_data/version 2>/dev/null || exit 1)
+SUPERGATEWAY_PKG='supergateway@latest'
 DOCKERFILE_NAME="Dockerfile.$REPO_NAME"
 
 # Create a temporary file safely
@@ -86,11 +87,20 @@ RUN apk add --no-cache \\
     netcat-openbsd \\
     bind-tools \\
     iputils \\
-    busybox-extras
+    busybox-extras \\
+    nodejs \\
+    npm
 
 # Replace Alpine HAProxy with official build (native QUIC/H3 support)
 COPY --from=haproxy-src /usr/local/sbin/haproxy /usr/sbin/haproxy
 RUN mkdir -p /usr/local/sbin && ln -sf /usr/sbin/haproxy /usr/local/sbin/haproxy
+
+# Install supergateway (stdio<->HTTP/SSE/WS bridge wrapping the Go MCP server)
+RUN --mount=type=cache,target=/root/.npm \\
+    npm config set update-notifier false && \\
+    npm install -g ${SUPERGATEWAY_PKG} --omit=dev --no-audit --no-fund --loglevel error && \\
+    rm -rf /tmp/* /var/tmp/* && \\
+    rm -rf /usr/local/lib/node_modules/npm/man /usr/local/lib/node_modules/npm/docs /usr/local/lib/node_modules/npm/html
 
 WORKDIR /app
 
@@ -105,7 +115,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/banner.sh \\
 
 ENV SERVER_PORT=9092
 ENV INTERNAL_SERVER_PORT=38011
-ENV TRANSPORT_MODE=sse
+ENV TRANSPORT_MODE=stdio
+ENV PROTOCOL=SHTTP
+ENV STATEFUL=true
+ENV SESSION_TIMEOUT_MS=3600000
 ENV CONFIG_PATH=/app/config.json
 ENV API_KEY=
 ENV CORS=
