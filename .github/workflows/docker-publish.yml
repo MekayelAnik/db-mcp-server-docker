@@ -1060,30 +1060,42 @@ jobs:
           # Build [{version, platform, platform_slug, runner}, ...]
           # Runner affinity lookup table: maps each Docker platform to a runner suffix
           ACTION_RUNNER="${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-24.04' }}"
+          # Allow an override for riscv64 since GitHub-hosted has no riscv
+          # runner label; users with a self-hosted pool can point this at
+          # the right suffix (e.g. "-riscv-selfhosted") or the empty string
+          # to emulate via QEMU on an amd64 runner.
+          RISCV_SUFFIX="${{ vars.ACTION_RUNNER_RISCV_SUFFIX || '-riscv' }}"
           runner_suffix_for() {
             case "$1" in
-              linux/amd64)    echo "" ;;        # native amd64
-              linux/arm64)    echo "-arm" ;;    # native arm64
-              linux/arm/v7)   echo "-arm" ;;    # arm64 runner, native ARM32 compat
-              linux/arm/v6)   echo "-arm" ;;    # arm64 runner, native ARM32 compat
-              linux/riscv64)  echo "-riscv" ;;  # native riscv64
-              linux/386)      echo "" ;;        # amd64 runner, native i386 compat
-              linux/s390x)    echo "" ;;        # amd64 runner, QEMU
-              linux/ppc64le)  echo "" ;;        # amd64 runner, QEMU
-              linux/mips64le) echo "" ;;        # amd64 runner, QEMU
-              *)              echo "" ;;        # fallback to amd64 runner
+              linux/amd64)    echo "" ;;              # native amd64
+              linux/arm64)    echo "-arm" ;;          # native arm64
+              linux/arm/v7)   echo "-arm" ;;          # arm64 runner, native ARM32 compat
+              linux/arm/v6)   echo "-arm" ;;          # arm64 runner, native ARM32 compat
+              linux/riscv64)  echo "$RISCV_SUFFIX" ;; # riscv64 (requires self-hosted pool unless overridden)
+              linux/386)      echo "" ;;              # amd64 runner, native i386 compat
+              linux/s390x)    echo "" ;;              # amd64 runner, QEMU
+              linux/ppc64le)  echo "" ;;              # amd64 runner, QEMU
+              linux/mips64le) echo "" ;;              # amd64 runner, QEMU
+              *)              echo "" ;;              # fallback to amd64 runner
             esac
           }
 
           # Build the JSON matrix using the lookup table
           MATRIX="["
           FIRST=true
+          RISCV_WARNED=false
           for v in $(echo "$VERSIONS" | jq -r '.[]'); do
             IFS=',' read -ra PLAT_ARRAY <<< "$(echo "$PLATFORMS" | tr -d ' ')"
             for p in "${PLAT_ARRAY[@]}"; do
               [ -z "$p" ] && continue
               SUFFIX=$(runner_suffix_for "$p")
               RUNNER="${ACTION_RUNNER}${SUFFIX}"
+              # Warn once if a riscv64 entry will queue on a label that does
+              # not exist as a GitHub-hosted runner and no override is set.
+              if [[ "$p" == "linux/riscv64" && "$SUFFIX" == "-riscv" && "$RISCV_WARNED" == "false" && -z "${{ vars.ACTION_RUNNER_RISCV_SUFFIX }}" ]]; then
+                echo "::warning::linux/riscv64 resolved to runner label '$RUNNER' but GitHub-hosted does not provide riscv runners. Set repo var ACTION_RUNNER_RISCV_SUFFIX (e.g. '' for QEMU emulation on amd64, or a self-hosted suffix) to avoid indefinite queuing."
+                RISCV_WARNED=true
+              fi
               SLUG=$(echo "$p" | tr '/' '-')
               $FIRST || MATRIX+=","
               FIRST=false
@@ -2077,8 +2089,13 @@ jobs:
           GHCR_STABLE=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:stable" 2>/dev/null \
             | jq -r '.Digest' || echo "none")
 
-          if [[ "$GHCR_STABLE" == "$TARGET" ]]; then
-            echo "stable already points to $STABLE_VERSION on GHCR — nothing to do"
+          # Docker Hub :stable digest — needed to decide whether to sync DH
+          # from GHCR below. Missing tag (first run) -> "none" forces a sync.
+          DH_STABLE=$(skopeo inspect "docker://${{ env.DOCKERHUB_REPO }}:stable" 2>/dev/null \
+            | jq -r '.Digest' || echo "none")
+
+          if [[ "$GHCR_STABLE" == "$TARGET" && "$DH_STABLE" == "$TARGET" ]]; then
+            echo "stable already points to $STABLE_VERSION on both GHCR and Docker Hub — nothing to do"
             exit 0
           fi
 
