@@ -81,16 +81,23 @@ on:
         default: latest
 
       force_build:
-        description: 'Force rebuild even if image exists in one or both registries'
+        description: |
+          Force rebuild even if image exists in one or both registries.
+          In auto-check: when upstream HEAD coincides with a release tag
+          (upstream git tag OR already-published :X.Y.Z in GHCR),
+          setting this redirects the run to rebuild that :X.Y.Z instead
+          of skipping. No effect when HEAD is not a release commit.
         required: false
         type: boolean
         default: false
 
       force_nightly:
         description: |
-          Force nightly build regardless of skip checks (HEAD vs release tags
-          and :nightly label). Useful when last nightly failed and you want
-          to retry immediately instead of waiting for next upstream commit.
+          Rebuild :nightly even when HEAD is already published as :nightly
+          (bypass of the :nightly label-match check only). Does NOT
+          bypass the release checks — if HEAD is a release commit, a
+          nightly build is always refused regardless of this flag.
+          Use force_build instead to rebuild a release image.
         required: false
         type: boolean
         default: false
@@ -112,17 +119,6 @@ on:
         required: false
         type: string
         default: ''
-
-      allow_nightly_on_release_commit:
-        description: |
-          Allow a nightly build of a commit that is also tagged as an upstream
-          release (e.g. HEAD == v1.9.0's commit). Normally refused to prevent
-          shipping :nightly and :X.Y.Z with identical content under different
-          semantics. Turn on only when you're intentionally re-validating a
-          release commit via the nightly channel.
-        required: false
-        type: boolean
-        default: false
 
       skip_existing:
         description: 'Skip versions already present in both registries'
@@ -339,6 +335,11 @@ jobs:
       nightly_sha:         ${{ steps.resolve-nightly.outputs.nightly_sha }}
       nightly_short_sha:   ${{ steps.resolve-nightly.outputs.nightly_short_sha }}
       nightly_skip_reason: ${{ steps.resolve-nightly.outputs.skip_reason }}
+      # Populated by resolve-nightly when HEAD coincides with a release
+      # (git tag OR published :X.Y.Z) AND force_build=true. Signals
+      # determine-versions to inject the matching tag as a build entry
+      # instead of skipping. Empty otherwise.
+      rebuild_release:     ${{ steps.resolve-nightly.outputs.rebuild_release }}
       missing_releases_json: ${{ steps.discover-releases.outputs.missing_releases_json }}
 
     steps:
@@ -662,9 +663,32 @@ jobs:
         env:
           SKIP_NIGHTLY_SHAS: ${{ vars.SKIP_NIGHTLY_SHAS }}
           FORCE_NIGHTLY: ${{ github.event.inputs.force_nightly }}
+          FORCE_BUILD:   ${{ github.event.inputs.force_build }}
           SHA_OVERRIDE:  ${{ github.event.inputs.nightly_sha_override }}
-          ALLOW_ON_RELEASE: ${{ github.event.inputs.allow_nightly_on_release_commit }}
         run: |
+          # Emit empty-output skip helper. Call as:  skip "reason"
+          skip() {
+            echo "⏭️  $1"
+            {
+              echo "nightly_sha="
+              echo "nightly_short_sha="
+              echo "rebuild_release="
+              echo "skip_reason=$1"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          # Emit release-rebuild redirect. Call as:  redirect_release "<tag>" "<reason>"
+          redirect_release() {
+            local tag="$1" reason="$2"
+            echo "♻  $reason — redirecting to :$tag rebuild (force_build=true)"
+            {
+              echo "nightly_sha="
+              echo "nightly_short_sha="
+              echo "rebuild_release=$tag"
+              echo "skip_reason=$reason"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
 
           # Retry-tolerant ls-remote HEAD — transient DNS/TLS blips shouldn't
           # silently skip nightly for the whole cron tick.
@@ -689,52 +713,67 @@ jobs:
           else
             if ! CANDIDATE_SHA=$(resolve_head); then
               echo "::warning::Could not resolve upstream HEAD after 3 attempts — skipping nightly"
-              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
-              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
-              echo "skip_reason=ls-remote HEAD failed" >> "$GITHUB_OUTPUT"
-              exit 0
+              skip "ls-remote HEAD failed"
             fi
             echo "Upstream HEAD: $CANDIDATE_SHA"
           fi
 
-          # Skip-list check (repo variable SKIP_NIGHTLY_SHAS, comma-separated).
-          # Operator escape hatch for known-bad commits — overrides even force_nightly
-          # to prevent accidental rebuilds. Always honored.
-          # Each entry must be >=12 hex chars to avoid short-SHA prefix collisions.
+          # ── Gate 1: SKIP_NIGHTLY_SHAS denylist (fail-closed) ────────────────
+          # Operator escape hatch for known-bad commits — overrides ALL force
+          # flags to prevent accidental rebuilds. Each entry >=12 hex chars
+          # so short-SHA prefix collisions are not possible.
           if [[ -n "$SKIP_NIGHTLY_SHAS" ]]; then
             IFS=',' read -ra SKIP_ARR <<< "$SKIP_NIGHTLY_SHAS"
             for s in "${SKIP_ARR[@]}"; do
               s=$(echo "$s" | xargs)
               [[ -z "$s" ]] && continue
               if [[ ! "$s" =~ ^[0-9a-fA-F]{12,40}$ ]]; then
-                echo "::error::SKIP_NIGHTLY_SHAS entry '$s' must be 12-40 hex chars (prevents short-SHA collisions)"
+                echo "::error::SKIP_NIGHTLY_SHAS entry '$s' must be 12-40 hex chars"
                 exit 1
               fi
               s_lc="${s,,}"
               cand_lc="${CANDIDATE_SHA,,}"
-              # Full-length exact match OR candidate starts with the configured prefix.
               if [[ "$cand_lc" == "$s_lc"* ]]; then
-                echo "⛔ Nightly SHA $CANDIDATE_SHA matches SKIP_NIGHTLY_SHAS entry '$s' — skipping"
-                echo "nightly_sha="       >> "$GITHUB_OUTPUT"
-                echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
-                echo "skip_reason=SHA in SKIP_NIGHTLY_SHAS repo variable" >> "$GITHUB_OUTPUT"
-                exit 0
+                skip "SHA in SKIP_NIGHTLY_SHAS repo variable (matched prefix '$s')"
               fi
             done
           fi
 
-          # Tag-match check ALWAYS runs unless allow_nightly_on_release_commit=true
-          # was explicitly set. force_nightly alone is not enough — that flag is
-          # for retrying a failed nightly on the same HEAD, not for rebuilding
-          # a release commit under the nightly tag (which would ship bit-
-          # identical content as both :X.Y.Z and :nightly-DATE-SHORT, confusing
-          # downstream consumers). skip-list check above is also not bypassable.
-          # Fetch ls-remote --tags with retry; fail-closed if we genuinely
-          # can't reach upstream so a release-commit doesn't slip through as
-          # nightly due to a transient network blip.
+          # ── Gate 2: On-main ancestry guard ─────────────────────────────────
+          # Only meaningful when SHA_OVERRIDE is set — the ls-remote HEAD path
+          # already resolves to the tip of the default branch by definition.
+          # Shallow-fetch main into a scratch bare repo so merge-base can work
+          # without cloning full history.
+          if [[ -n "$SHA_OVERRIDE" ]]; then
+            SCRATCH=$(mktemp -d)
+            (
+              cd "$SCRATCH" || { echo "::error::could not cd to scratch dir $SCRATCH"; exit 1; }
+              git init --bare --quiet
+              # Depth 500 covers any realistic review window.
+              if ! git fetch --depth=500 --quiet \
+                    https://github.com/FreePeak/db-mcp-server.git \
+                    refs/heads/main:refs/heads/main 2>/dev/null; then
+                echo "::error::Could not fetch upstream main for on-main ancestry check"
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor "$CANDIDATE_SHA" refs/heads/main 2>/dev/null; then
+                echo "::error::$CANDIDATE_SHA is not on upstream main — refusing nightly build"
+                exit 1
+              fi
+            )
+            rm -rf "$SCRATCH"
+            echo "✓ $CANDIDATE_SHA is on upstream main"
+          fi
+
+          # ── Gate 3: Upstream git-tag match ─────────────────────────────────
+          # If HEAD is any annotated or lightweight tag, it IS a release commit.
+          # Never build nightly for it. force_build=true redirects to rebuilding
+          # that :X.Y.Z instead. Fail-closed on network error so a release
+          # commit cannot slip through as nightly during a transient outage.
           TAGS_RAW=""
           for attempt in 1 2 3; do
-            TAGS_RAW=$(git ls-remote --tags https://github.com/FreePeak/db-mcp-server.git 2>/dev/null) && [[ -n "$TAGS_RAW" ]] && break
+            TAGS_RAW=$(git ls-remote --tags https://github.com/FreePeak/db-mcp-server.git 2>/dev/null) \
+              && [[ -n "$TAGS_RAW" ]] && break
             [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
           done
           if [[ -z "$TAGS_RAW" ]]; then
@@ -742,9 +781,7 @@ jobs:
             exit 1
           fi
 
-          # Dereferenced tag SHAs via peel lines. For annotated tags, the
-          # ^{} entry carries the commit SHA; for lightweight tags only the
-          # direct entry exists. This awk keeps the commit SHA in both cases.
+          # Awk: peel annotated tags so tags[name]=commit-sha regardless of kind.
           TAG_SHAS=$(echo "$TAGS_RAW" \
             | awk '/\^\{\}$/ { tags[$2]=$1; next } { if (!($2 in tags)) tags[$2]=$1 } END { for (t in tags) print tags[t] }' \
             | sort -u)
@@ -753,39 +790,80 @@ jobs:
             MATCHED_TAG=$(echo "$TAGS_RAW" \
               | awk -v s="$CANDIDATE_SHA" '$1==s && $2 !~ /\^\{\}$/ { sub("refs/tags/","",$2); print $2 }' \
               | head -1)
-            if [[ "$ALLOW_ON_RELEASE" == "true" ]]; then
-              echo "⚠ HEAD matches release tag $MATCHED_TAG — allowed via allow_nightly_on_release_commit"
+            # Strip leading 'v' so downstream uses the same X.Y.Z string.
+            MATCHED_VER="${MATCHED_TAG#v}"
+            if [[ "$FORCE_BUILD" == "true" ]]; then
+              redirect_release "$MATCHED_VER" "HEAD matches upstream release tag $MATCHED_TAG"
             else
-              echo "⏭️  HEAD matches release tag: $MATCHED_TAG — skipping nightly"
-              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
-              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
-              echo "skip_reason=HEAD matches release tag $MATCHED_TAG" >> "$GITHUB_OUTPUT"
-              exit 0
+              skip "HEAD matches upstream release tag $MATCHED_TAG (set force_build=true to rebuild :$MATCHED_VER)"
             fi
           fi
 
-          # force_nightly bypasses only the :nightly label-match check (so the
-          # same SHA can be rebuilt if last run failed). Everything above this
-          # point is still enforced.
+          # ── Gate 4: GHCR registry-label scan ───────────────────────────────
+          # Source of truth for "already published as a release" is the image
+          # revision label, not git tags. Catches the case where upstream
+          # hasn't cut a tag yet but we already pushed :X.Y.Z for that commit,
+          # and the case where a previous run built a release but the
+          # pipeline-state branch wasn't updated.
+          # Fail-closed on scan error (per-run impact: any transient 5xx from
+          # GHCR would otherwise silently promote a released SHA to :nightly).
+          GHCR_TAGS_JSON=""
+          for attempt in 1 2 3; do
+            GHCR_TAGS_JSON=$(skopeo list-tags \
+              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+              "docker://${{ env.GHCR_REPO }}" 2>/dev/null) \
+              && [[ -n "$GHCR_TAGS_JSON" ]] && break
+            [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$GHCR_TAGS_JSON" ]]; then
+            echo "::error::Could not list GHCR tags after 3 attempts — refusing nightly build without release-label scan"
+            exit 1
+          fi
+
+          # Keep only strict semver (X.Y.Z). Excludes :latest, :stable, :nightly,
+          # :nightly-*, :sha-*, and any promotion pointers.
+          RELEASE_TAGS=$(echo "$GHCR_TAGS_JSON" \
+            | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))')
+
+          for T in $RELEASE_TAGS; do
+            REV=$(skopeo inspect \
+              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+              "docker://${{ env.GHCR_REPO }}:${T}" 2>/dev/null \
+              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' || echo "")
+            if [[ -n "$REV" && "$REV" == "$CANDIDATE_SHA" ]]; then
+              if [[ "$FORCE_BUILD" == "true" ]]; then
+                redirect_release "$T" "HEAD already published as :$T in GHCR"
+              else
+                skip "HEAD already published as :$T in GHCR (set force_build=true to rebuild)"
+              fi
+            fi
+          done
+
+          # ── Gate 5: :nightly manifest label match ──────────────────────────
+          # Only gate that force_nightly bypasses. Useful for retrying a failed
+          # nightly on the same HEAD, or rebuilding when base-image-only
+          # changes invalidate the old layer digests.
           if [[ "$FORCE_NIGHTLY" != "true" ]]; then
-            NIGHTLY_REV=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:nightly" 2>/dev/null \
+            NIGHTLY_REV=$(skopeo inspect \
+              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+              "docker://${{ env.GHCR_REPO }}:nightly" 2>/dev/null \
               | jq -r '.Labels["org.opencontainers.image.revision"] // empty' || echo "")
             if [[ -n "$NIGHTLY_REV" && "$NIGHTLY_REV" == "$CANDIDATE_SHA" ]]; then
-              echo "⏭️  HEAD already published as :nightly — skipping"
-              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
-              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
-              echo "skip_reason=HEAD already built as :nightly" >> "$GITHUB_OUTPUT"
-              exit 0
+              skip "HEAD already built as :nightly (set force_nightly=true to retry)"
             fi
           else
             echo "⚡ force_nightly=true — bypassing :nightly label-match check"
           fi
 
+          # ── Clear to build ─────────────────────────────────────────────────
           SHORT="${CANDIDATE_SHA:0:7}"
           echo "🌙 Nightly candidate: $CANDIDATE_SHA (short: $SHORT)"
-          echo "nightly_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
-          echo "nightly_short_sha=$SHORT"   >> "$GITHUB_OUTPUT"
-          echo "skip_reason="               >> "$GITHUB_OUTPUT"
+          {
+            echo "nightly_sha=$CANDIDATE_SHA"
+            echo "nightly_short_sha=$SHORT"
+            echo "rebuild_release="
+            echo "skip_reason="
+          } >> "$GITHUB_OUTPUT"
 
       - name: Determine versions to build
         id: determine-versions
@@ -809,14 +887,26 @@ jobs:
               MISSING_JSON='${{ steps.discover-releases.outputs.missing_releases_json }}'
               NIGHTLY_SHA='${{ steps.resolve-nightly.outputs.nightly_sha }}'
               NIGHTLY_REASON='${{ steps.resolve-nightly.outputs.skip_reason }}'
+              REBUILD_RELEASE='${{ steps.resolve-nightly.outputs.rebuild_release }}'
 
               # Start from the set of release versions missing from GHCR.
               ENTRIES="${MISSING_JSON:-[]}"
               # jq-safety: if the step didn't run (e.g. set-action bypassed), default to []
               echo "$ENTRIES" | jq . >/dev/null 2>&1 || ENTRIES='[]'
 
-              # Append nightly sentinel if HEAD is fresh and distinct from releases.
-              if [[ -n "$NIGHTLY_SHA" ]]; then
+              # Release rebuild redirect from resolve-nightly (HEAD coincides
+              # with a release AND force_build=true). Injected as a first-
+              # class build entry; de-duplicated against missing_releases_json
+              # so the matrix never has the same version twice.
+              if [[ -n "$REBUILD_RELEASE" ]]; then
+                ENTRIES=$(echo "$ENTRIES" | jq -c --arg v "$REBUILD_RELEASE" '. + [$v] | unique')
+                echo "♻  Release rebuild enqueued: $REBUILD_RELEASE (force_build)"
+              fi
+
+              # Append nightly sentinel if HEAD is fresh and distinct from
+              # releases. Mutually exclusive with release-rebuild redirect —
+              # resolve-nightly never emits both in the same run.
+              if [[ -z "$REBUILD_RELEASE" && -n "$NIGHTLY_SHA" ]]; then
                 ENTRIES=$(echo "$ENTRIES" | jq -c '. + ["nightly"]')
                 echo "🌙 Nightly candidate enqueued ($NIGHTLY_SHA)"
               elif [[ -n "$NIGHTLY_REASON" ]]; then
