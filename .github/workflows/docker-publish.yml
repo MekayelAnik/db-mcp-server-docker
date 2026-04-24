@@ -1352,27 +1352,6 @@ jobs:
             org.opencontainers.image.revision=${{ steps.upstream.outputs.upstream_sha }}
             org.opencontainers.image.base.digest=${{ needs.check-releases.outputs.base_combined_digest }}
 
-      # ── Get base image digest for change-tracking label ───────────────────
-      # Target the runtime stage (final FROM line), not the first FROM —
-      # first FROM is the xx cross-compile helper, whose digest isn't what
-      # runtime security scans and base-digest tracking should track.
-      - name: Get base image digest
-        id: base-digest
-        run: |
-          # Ignore FROM lines that reference other build stages by alias
-          # (`FROM builder`, `FROM haproxy-src`) — we only want real images.
-          BASE=$(awk '
-            /^FROM / {
-              img=$2
-              if (img ~ /^--platform/) img=$3
-              if (img ~ /[:\/]/) last=img
-            }
-            END { print last }' Dockerfile)
-          DIG=$(skopeo inspect "docker://${BASE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
-          echo "digest=$DIG"   >> "$GITHUB_OUTPUT"
-          echo "image=$BASE"   >> "$GITHUB_OUTPUT"
-          echo "Base (runtime): $BASE @ $DIG"
-
       # ── Platform-scoped cache ref ──────────────────────────────────────────
       - name: Determine cache ref
         id: cache-ref
@@ -1402,6 +1381,8 @@ jobs:
       # chosen ref (GHCR mirror or Docker Hub fallback). This step only has
       # to sed-swap; no network probes per matrix entry. Uses # as sed
       # delimiter so the ERE | alternation in each pattern parses cleanly.
+      # Address `/^FROM/` restricts substitution to FROM lines so Dockerfile
+      # comments containing image refs are not silently rewritten.
       - name: Resolve base images
         id: base-images
         env:
@@ -1418,11 +1399,11 @@ jobs:
               echo "⚠ $label: no ref configured, skipping"
               return 0
             fi
-            if grep -qE "$pattern" ./Dockerfile; then
-              sed -i -E "s#$pattern#${chosen}#" ./Dockerfile
+            if grep -qE "^FROM.*(${pattern})" ./Dockerfile; then
+              sed -i -E "/^FROM/ s#${pattern}#${chosen}#" ./Dockerfile
               echo "$label: swapped to $chosen"
             else
-              echo "$label: pattern '$pattern' not found — no-op"
+              echo "$label: pattern '$pattern' not found on any FROM line — no-op"
             fi
           }
 
@@ -1434,6 +1415,29 @@ jobs:
           echo "─── Final FROM lines ──────────────────────────────"
           grep -nE "^FROM" ./Dockerfile
           echo "───────────────────────────────────────────────────"
+
+      # ── Get base image digest for change-tracking label ───────────────────
+      # Target the runtime stage (final FROM line), not the first FROM —
+      # first FROM is the xx cross-compile helper, whose digest isn't what
+      # runtime security scans and base-digest tracking should track.
+      # MUST run AFTER `base-images` so the inspected ref matches whatever
+      # the build will actually pull (incl. GHCR mirror swaps).
+      - name: Get base image digest
+        id: base-digest
+        run: |
+          # Ignore FROM lines that reference other build stages by alias
+          # (`FROM builder`, `FROM haproxy-src`) — we only want real images.
+          BASE=$(awk '
+            /^FROM / {
+              img=$2
+              if (img ~ /^--platform/) img=$3
+              if (img ~ /[:\/]/) last=img
+            }
+            END { print last }' Dockerfile)
+          DIG=$(skopeo inspect "docker://${BASE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
+          echo "digest=$DIG"   >> "$GITHUB_OUTPUT"
+          echo "image=$BASE"   >> "$GITHUB_OUTPUT"
+          echo "Base (runtime): $BASE @ $DIG"
 
 
       # ── Build (with timeout acting as execute_with_retry wrapper) ──────────
@@ -2282,4 +2286,4 @@ jobs:
             echo "No changes to pipeline state — skipping commit"
           fi
 
-          echo "Updated pipeline-state branch with SHA $CURRENT_SHA, latest_sha_since=$LATEST_SHA_SINCE"
+          echo "Updated pipeline-state branch with SHA $RENOVATE_SHA, latest_sha_since=$LATEST_SHA_SINCE"
