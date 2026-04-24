@@ -1385,44 +1385,45 @@ jobs:
           echo "Version:     ${{ matrix.version }}"
           echo "Timeout:     ${{ needs.check-releases.outputs.build_timeout_min }}min"
 
-      # ── Swap FROM lines to pre-resolved base refs ─────────────────────────
+      # ── Generate Dockerfile via DockerfileModifier.sh ─────────────────────
       # check-releases already probed each base image once and published the
-      # chosen ref (GHCR mirror or Docker Hub fallback). This step only has
-      # to sed-swap; no network probes per matrix entry. Uses # as sed
-      # delimiter so the ERE | alternation in each pattern parses cleanly.
-      # Address `/^FROM/` restricts substitution to FROM lines so Dockerfile
-      # comments containing image refs are not silently rewritten.
-      - name: Resolve base images
-        id: base-images
+      # chosen ref (GHCR mirror if reachable, else Docker Hub fallback).
+      # This step writes those refs into build_data/, then runs the Modifier
+      # to produce Dockerfile.db-mcp-server from the committed template.
+      # Replaces the prior sed-swap-on-committed-Dockerfile approach so the
+      # image refs flow through the same mechanism all sibling MCP repos use.
+      # Fallback chain per ref:
+      #   1. base_ref_* output from check-releases (GHCR-or-DH)
+      #   2. hardcoded DH short-ref here (if check-releases output empty)
+      #   3. Modifier-level default (if build_data file missing entirely)
+      - name: Generate Dockerfile
+        id: gen-dockerfile
         env:
-          HAPROXY_REF: ${{ needs.check-releases.outputs.base_ref_haproxy }}
-          BUILDER_REF: ${{ needs.check-releases.outputs.base_ref_builder }}
-          RUNTIME_REF: ${{ needs.check-releases.outputs.base_ref_runtime }}
-          XX_REF:      ${{ needs.check-releases.outputs.base_ref_xx }}
+          HAPROXY_REF:    ${{ needs.check-releases.outputs.base_ref_haproxy }}
+          BUILDER_REF:    ${{ needs.check-releases.outputs.base_ref_builder }}
+          RUNTIME_REF:    ${{ needs.check-releases.outputs.base_ref_runtime }}
+          XX_REF:         ${{ needs.check-releases.outputs.base_ref_xx }}
+          MATRIX_VERSION: ${{ matrix.version }}
         run: |
           set -euo pipefail
+          mkdir -p build_data
+          echo "${BUILDER_REF:-golang:alpine}"       > build_data/base-image
+          echo "${HAPROXY_REF:-haproxy:lts-alpine}"  > build_data/haproxy-image
+          echo "${RUNTIME_REF:-alpine:latest}"       > build_data/runtime-image
+          echo "${XX_REF:-tonistiigi/xx:1.9.0}"      > build_data/xx-image
+          echo "${MATRIX_VERSION}"                   > build_data/version
 
-          swap() {
-            local chosen="$1" pattern="$2" label="$3"
-            if [[ -z "$chosen" ]]; then
-              echo "⚠ $label: no ref configured, skipping"
-              return 0
-            fi
-            if grep -qE "^FROM.*(${pattern})" ./Dockerfile; then
-              sed -i -E "/^FROM/ s#${pattern}#${chosen}#" ./Dockerfile
-              echo "$label: swapped to $chosen"
-            else
-              echo "$label: pattern '$pattern' not found on any FROM line — no-op"
-            fi
-          }
+          echo "─── build_data ────────────────────────────────────"
+          for f in build_data/base-image build_data/haproxy-image \
+                   build_data/runtime-image build_data/xx-image \
+                   build_data/version; do
+            printf "  %-30s %s\n" "$f" "$(cat "$f")"
+          done
 
-          swap "$HAPROXY_REF" 'haproxy:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/haproxy:[A-Za-z0-9._-]+' "HAProxy"
-          swap "$BUILDER_REF" 'golang:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/golang:[A-Za-z0-9._-]+' "Builder (golang)"
-          swap "$RUNTIME_REF" 'alpine:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/alpine:[A-Za-z0-9._-]+' "Runtime (alpine)"
-          swap "$XX_REF"      'tonistiigi/xx:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/tonistiigi/xx:[A-Za-z0-9._-]+' "xx (cross-compile helper)"
+          bash ./DockerfileModifier.sh
 
           echo "─── Final FROM lines ──────────────────────────────"
-          grep -nE "^FROM" ./Dockerfile
+          grep -nE "^FROM" ./Dockerfile.db-mcp-server
           echo "───────────────────────────────────────────────────"
 
       # ── Get base image digest for change-tracking label ───────────────────
@@ -1442,7 +1443,7 @@ jobs:
               if (img ~ /^--platform/) img=$3
               if (img ~ /[:\/]/) last=img
             }
-            END { print last }' Dockerfile)
+            END { print last }' Dockerfile.db-mcp-server)
           DIG=$(skopeo inspect "docker://${BASE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
           echo "digest=$DIG"   >> "$GITHUB_OUTPUT"
           echo "image=$BASE"   >> "$GITHUB_OUTPUT"
@@ -1456,7 +1457,7 @@ jobs:
         timeout-minutes: ${{ fromJSON(needs.check-releases.outputs.build_timeout_min || '60') }}
         with:
           context: ./upstream
-          file: ./Dockerfile
+          file: ./Dockerfile.db-mcp-server
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           # Pull latest base layer on every build (security + freshness)

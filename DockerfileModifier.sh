@@ -2,8 +2,13 @@
 set -euxo pipefail
 # Set variables first
 REPO_NAME='db-mcp-server'
-GO_IMAGE=$(cat ./build_data/base-image 2>/dev/null || echo "golang:latest-alpine")
+# Base image refs — CI populates these from probed GHCR mirrors
+# (ghcr.io/mekayelanik/base-images/...) when available, else falls back
+# to Docker Hub short refs. Local builds read the committed defaults.
+GO_IMAGE=$(cat ./build_data/base-image 2>/dev/null       || echo "golang:alpine")
 HAPROXY_IMAGE=$(cat ./build_data/haproxy-image 2>/dev/null || echo "haproxy:lts-alpine")
+XX_IMAGE=$(cat ./build_data/xx-image 2>/dev/null          || echo "tonistiigi/xx:1.9.0")
+RUNTIME_IMAGE=$(cat ./build_data/runtime-image 2>/dev/null || echo "alpine:latest")
 DB_MCP_VERSION=$(cat ./build_data/version 2>/dev/null || exit 1)
 SUPERGATEWAY_PKG='supergateway@latest'
 DOCKERFILE_NAME="Dockerfile.$REPO_NAME"
@@ -20,7 +25,7 @@ if [ -e ./build_data/publication ]; then
     {
         echo "ARG GO_IMAGE=$GO_IMAGE"
         echo "ARG DB_MCP_VERSION=$DB_MCP_VERSION"
-        echo "FROM alpine:latest"
+        echo "FROM $RUNTIME_IMAGE"
     } > "$TEMP_FILE"
 else
     # Write the Dockerfile content to the temporary file first
@@ -35,7 +40,7 @@ else
 # =============================================================================
 
 # ── xx cross-compilation helpers ──────────────────────────────────────────────
-FROM --platform=\$BUILDPLATFORM tonistiigi/xx:1.9.0 AS xx
+FROM --platform=\$BUILDPLATFORM $XX_IMAGE AS xx
 
 # ── Stage 1: Builder ──────────────────────────────────────────────────────────
 FROM --platform=\$BUILDPLATFORM $GO_IMAGE AS builder
@@ -76,7 +81,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \\
 FROM $HAPROXY_IMAGE AS haproxy-src
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM alpine:latest
+FROM $RUNTIME_IMAGE
 
 RUN apk add --no-cache \\
     ca-certificates \\
