@@ -584,16 +584,45 @@ jobs:
         env:
           FORCE_TAG: ${{ github.event.inputs.force_release_tag }}
         run: |
-          # Retry-tolerant skopeo inspect (Docker Hub rate-limits are common on
-          # large release lists; GHCR has no anon rate limit for auth callers).
+          # Retry-tolerant skopeo inspect. Distinguishes "image not present"
+          # (404 / manifest unknown — definitive, no retry) from transient
+          # registry errors (rate limit, 5xx — back off and retry). Without
+          # the 404 fast-path the serial loop ballooned to ~10min on a fresh
+          # GHCR repo because every probe maxed 3×backoff (~30s/version).
           rl_inspect() {
-            local ref="$1" attempt
+            local ref="$1" attempt err_file out
+            err_file=$(mktemp)
             for attempt in 1 2 3; do
-              if skopeo inspect "docker://${ref}" &>/dev/null; then echo yes; return 0; fi
+              if skopeo inspect "docker://${ref}" >/dev/null 2>"$err_file"; then
+                rm -f "$err_file"; echo yes; return 0
+              fi
+              if grep -qE 'manifest unknown|name unknown|NAME_UNKNOWN|repository name not known|404' "$err_file"; then
+                rm -f "$err_file"; echo no; return 0
+              fi
               [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
             done
+            rm -f "$err_file"
             echo no
           }
+          export -f rl_inspect
+
+          # Per-version probe runner for parallel xargs. Stdout is harvested
+          # back into MISSING; status logging goes to stderr so it doesn't
+          # contaminate the version list.
+          probe_version() {
+            local ver="$1"
+            if [[ -n "$FORCE_TAG" && "$ver" == "$FORCE_TAG" ]]; then
+              echo "  ⚡ $ver force-rebuild requested" >&2
+              echo "$ver"
+              return
+            fi
+            if [[ "$(rl_inspect "${GHCR_REPO}:${ver}")" == "no" ]]; then
+              echo "  ➕ $ver not in GHCR — will build" >&2
+              echo "$ver"
+            fi
+          }
+          export -f probe_version
+          export FORCE_TAG GHCR_REPO="${{ env.GHCR_REPO }}"
 
           # gh CLI has built-in retry + token auth from GH_TOKEN.
           ALL_VERS=$(GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release list \
@@ -610,24 +639,12 @@ jobs:
             exit 0
           fi
 
+          # Parallel probe: -P 20 caps concurrency to match matrix max-parallel.
           # FORCE_TAG comes through env: to avoid shell injection if a user
           # pastes metachars into the workflow_dispatch input field.
-          MISSING=()
-          while IFS= read -r ver; do
-            [[ -z "$ver" ]] && continue
-            # Force-tag bypass: unconditionally enqueue the requested version
-            # (must still exist upstream to land here).
-            if [[ -n "$FORCE_TAG" && "$ver" == "$FORCE_TAG" ]]; then
-              MISSING+=("$ver")
-              echo "  ⚡ $ver force-rebuild requested"
-              continue
-            fi
-            EXISTS=$(rl_inspect "${{ env.GHCR_REPO }}:${ver}")
-            if [[ "$EXISTS" == "no" ]]; then
-              MISSING+=("$ver")
-              echo "  ➕ $ver not in GHCR — will build"
-            fi
-          done <<< "$ALL_VERS"
+          mapfile -t MISSING < <(echo "$ALL_VERS" \
+            | xargs -P 20 -I{} bash -c 'probe_version "$@"' _ {} \
+            | sort -V)
 
           # Validate force_release_tag matched an actual upstream release
           if [[ -n "$FORCE_TAG" ]]; then
