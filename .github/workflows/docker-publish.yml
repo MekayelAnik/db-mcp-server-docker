@@ -823,14 +823,31 @@ jobs:
           # Fail-closed on scan error (per-run impact: any transient 5xx from
           # GHCR would otherwise silently promote a released SHA to :nightly).
           GHCR_TAGS_JSON=""
+          GHCR_SCAN_STATUS="unset"
           for attempt in 1 2 3; do
-            GHCR_TAGS_JSON=$(skopeo list-tags \
-              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-              "docker://${{ env.GHCR_REPO }}" 2>/dev/null) \
-              && [[ -n "$GHCR_TAGS_JSON" ]] && break
+            GHCR_ERR=$(mktemp)
+            if GHCR_TAGS_JSON=$(skopeo list-tags \
+                 --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+                 "docker://${{ env.GHCR_REPO }}" 2>"$GHCR_ERR") \
+                 && [[ -n "$GHCR_TAGS_JSON" ]]; then
+              GHCR_SCAN_STATUS="ok"
+              rm -f "$GHCR_ERR"
+              break
+            fi
+            # First-publish: repo not yet created in GHCR. Treat as empty
+            # tag set so gate can pass cleanly on the very first build.
+            if grep -qE 'name unknown|NAME_UNKNOWN|manifest unknown|repository name not known' "$GHCR_ERR"; then
+              echo "ℹ️  GHCR repo ${{ env.GHCR_REPO }} not found — first publish, treating tag list as empty"
+              GHCR_TAGS_JSON='{"Tags":[]}'
+              GHCR_SCAN_STATUS="empty"
+              rm -f "$GHCR_ERR"
+              break
+            fi
+            cat "$GHCR_ERR" >&2
+            rm -f "$GHCR_ERR"
             [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
           done
-          if [[ -z "$GHCR_TAGS_JSON" ]]; then
+          if [[ "$GHCR_SCAN_STATUS" == "unset" ]]; then
             echo "::error::Could not list GHCR tags after 3 attempts — refusing nightly build without release-label scan"
             exit 1
           fi
