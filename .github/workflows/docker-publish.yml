@@ -86,6 +86,44 @@ on:
         type: boolean
         default: false
 
+      force_nightly:
+        description: |
+          Force nightly build regardless of skip checks (HEAD vs release tags
+          and :nightly label). Useful when last nightly failed and you want
+          to retry immediately instead of waiting for next upstream commit.
+        required: false
+        type: boolean
+        default: false
+
+      force_release_tag:
+        description: |
+          Force rebuild of a single release version (e.g. "1.8.0"), even if
+          already present in GHCR. Leave blank for no force. Intentionally
+          single-value — to rebuild multiple, use the build-versions action.
+        required: false
+        type: string
+        default: ''
+
+      nightly_sha_override:
+        description: |
+          Build this specific upstream commit SHA as :nightly instead of
+          current HEAD. Useful for testing a pre-release commit before it
+          reaches default branch. Leave blank to use HEAD.
+        required: false
+        type: string
+        default: ''
+
+      allow_nightly_on_release_commit:
+        description: |
+          Allow a nightly build of a commit that is also tagged as an upstream
+          release (e.g. HEAD == v1.9.0's commit). Normally refused to prevent
+          shipping :nightly and :X.Y.Z with identical content under different
+          semantics. Turn on only when you're intentionally re-validating a
+          release commit via the nightly channel.
+        required: false
+        type: boolean
+        default: false
+
       skip_existing:
         description: 'Skip versions already present in both registries'
         required: false
@@ -156,9 +194,13 @@ permissions:
   actions: read
   packages: read
 
-# One auto-check at a time; version builds are grouped by versions input
+# Serialize by action type so a running auto-check holds the lane against any
+# other auto-check or build-versions run, preventing two concurrent builds of
+# the same :X.Y.Z tag from racing on the final imagetools-create push.
+# Per-matrix-entry concurrency is still scoped by (version, platform_slug) in
+# the build-platform job, so distinct versions within one run parallelize.
 concurrency:
-  group: docker-build-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.versions || 'auto-check' }}
+  group: docker-build-${{ github.event.inputs.action || 'auto-check' }}
   cancel-in-progress: false
 
 env:
@@ -200,62 +242,14 @@ env:
 
 jobs:
   # ============================================================================
-  # Job 0a — Quick-check: read pipeline-state orphan branch, skip if unchanged
-  # ============================================================================
-  quick-check:
-    name: Quick state check
-    runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
-    outputs:
-      should_continue: ${{ steps.state.outputs.should_continue }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check pipeline state
-        id: state
-        run: |
-          FORCE="${{ github.event.inputs.force_build }}"
-          ACTION="${{ github.event.inputs.action || 'auto-check' }}"
-          CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
-
-          # Non-auto-check actions always continue
-          if [[ "$ACTION" != "auto-check" ]]; then
-            echo "should_continue=true" >> "$GITHUB_OUTPUT"
-            echo "Action '$ACTION' always runs"
-            exit 0
-          fi
-
-          # Force build always continues
-          if [[ "$FORCE" == "true" ]]; then
-            echo "should_continue=true" >> "$GITHUB_OUTPUT"
-            echo "Force build requested"
-            exit 0
-          fi
-
-          # Try to read last-built SHA from pipeline-state orphan branch
-          LAST_SHA=""
-          if git fetch origin pipeline-state --depth=1 2>/dev/null; then
-            LAST_SHA=$(git show origin/pipeline-state:last-built-sha 2>/dev/null || echo "")
-          fi
-
-          if [[ -n "$LAST_SHA" && "$LAST_SHA" == "$CURRENT_SHA" ]]; then
-            echo "should_continue=false" >> "$GITHUB_OUTPUT"
-            echo "Pipeline state shows SHA $CURRENT_SHA already built -- skipping"
-          else
-            echo "should_continue=true" >> "$GITHUB_OUTPUT"
-            echo "New SHA detected (last: ${LAST_SHA:-none}, current: $CURRENT_SHA)"
-          fi
-
-  # ============================================================================
-  # Job 0b — Resolve build profile
-  # Mirrors apply_build_profile() + build-compression-params() from .sh script
+  # Job 0 — Resolve build profile
+  # Mirrors apply_build_profile() + build-compression-params() from .sh script.
+  # (Old quick-check gate removed — check-releases now handles all skip logic
+  # via discover-releases / resolve-nightly / determine-versions. Pipeline-
+  # state SHA comparison was unsafe for nightly path.)
   # ============================================================================
   resolve-profile:
     name: Resolve build profile
-    needs: quick-check
-    if: needs.quick-check.outputs.should_continue == 'true'
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     outputs:
       compression_type:    ${{ steps.profile.outputs.compression_type }}
@@ -337,6 +331,18 @@ jobs:
       resource_limit_pct: ${{ needs.resolve-profile.outputs.resource_limit_pct }}
       commit_published:   ${{ steps.check-existing.outputs.commit_published }}
       head_sha_short:     ${{ steps.check-existing.outputs.head_sha_short }}
+      base_combined_digest: ${{ steps.check-base-image.outputs.combined_digest }}
+      # Pre-resolved base image refs (GHCR mirror if reachable, else Docker Hub
+      # short name) — build-platform reuses these instead of re-probing per
+      # matrix entry (saves ~4 imagetools calls × N entries).
+      base_ref_haproxy: ${{ steps.resolve-base-refs.outputs.haproxy }}
+      base_ref_builder: ${{ steps.resolve-base-refs.outputs.builder }}
+      base_ref_runtime: ${{ steps.resolve-base-refs.outputs.runtime }}
+      base_ref_xx:      ${{ steps.resolve-base-refs.outputs.xx }}
+      nightly_sha:         ${{ steps.resolve-nightly.outputs.nightly_sha }}
+      nightly_short_sha:   ${{ steps.resolve-nightly.outputs.nightly_short_sha }}
+      nightly_skip_reason: ${{ steps.resolve-nightly.outputs.skip_reason }}
+      missing_releases_json: ${{ steps.discover-releases.outputs.missing_releases_json }}
 
     steps:
       - name: Checkout
@@ -352,7 +358,10 @@ jobs:
       - name: Set action type
         id: set-action
         run: |
-          echo "action=${{ github.event.inputs.action }}" >> "$GITHUB_OUTPUT"
+          # Default to auto-check for non-dispatch triggers (e.g. cron-jobs.org
+          # POST with no inputs.action). Without the default, every downstream
+          # `if: steps.set-action.outputs.action == 'auto-check'` silently no-ops.
+          echo "action=${{ github.event.inputs.action || 'auto-check' }}" >> "$GITHUB_OUTPUT"
 
       - name: Set platforms
         id: set-platforms
@@ -470,40 +479,57 @@ jobs:
             exit 0
           fi
 
-          # Prefer the GHCR-mirrored builder image from BASE_IMAGE_BUILDER env
-          # (set from repo var) — avoids pinging Docker Hub and keeps digests
-          # consistent with what the actual build will pull.
-          BASE_IMAGE="${{ env.BASE_IMAGE_BUILDER }}"
-          if [[ -z "$BASE_IMAGE" ]]; then
-            BASE_IMAGE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
-          fi
-          if [[ -z "$BASE_IMAGE" ]]; then
+          # Track all four upstream bases — runtime (alpine) is the one that
+          # actually ships in the final image and is most security-relevant,
+          # but builder/xx/haproxy updates also warrant a rebuild so the
+          # compiled binary picks up toolchain fixes.
+          declare -A BASES=(
+            [runtime]="${{ env.BASE_IMAGE_RUNTIME }}"
+            [builder]="${{ env.BASE_IMAGE_BUILDER }}"
+            [haproxy]="${{ env.HAPROXY_IMAGE }}"
+            [xx]="${{ env.XX_IMAGE }}"
+          )
+          # Iterate in sorted key order so the combined hash is deterministic.
+          # Bash associative-array iteration order is implementation-defined
+          # and can vary across bash versions / runner updates, which would
+          # spuriously change the hash even when no base image moved.
+          COMBINED_DIGEST=""
+          for label in $(printf '%s\n' "${!BASES[@]}" | sort); do
+            img="${BASES[$label]}"
+            [[ -z "$img" ]] && continue
+            dig=$(skopeo inspect "docker://${img}" 2>/dev/null | jq -r '.Digest // "unknown"' || echo "unknown")
+            [[ -z "$dig" || "$dig" == "null" ]] && dig="unknown"
+            echo "  $label ($img) @ $dig"
+            COMBINED_DIGEST="${COMBINED_DIGEST}${label}=${dig};"
+          done
+          if [[ -z "$COMBINED_DIGEST" ]]; then
             echo "updated=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️  Could not determine base image"
+            echo "⚠️  Could not determine any base image digest"
             exit 0
           fi
-          echo "Base image: $BASE_IMAGE"
+          CURRENT_HASH=$(printf '%s' "$COMBINED_DIGEST" | sha256sum | awk '{print $1}')
+          echo "Combined base hash: $CURRENT_HASH"
+          # Exported so the build step can stamp this hash into
+          # org.opencontainers.image.base.digest on the new image, letting the
+          # next run compare apples to apples.
+          echo "combined_digest=$CURRENT_HASH" >> "$GITHUB_OUTPUT"
 
-          BASE_DIGEST=$(skopeo inspect "docker://${BASE_IMAGE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
-          echo "Base digest: $BASE_DIGEST"
-
-          # Inspect our own :latest on GHCR (not Docker Hub) — no pull-rate limits.
+          # Inspect our own :latest on GHCR (no pull-rate limits for auth callers).
           CURRENT_IMAGE="${{ env.GHCR_REPO }}:latest"
-          CURRENT_BASE=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null \
+          PREV_HASH=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null \
             | jq -r '.Labels["org.opencontainers.image.base.digest"] // empty' || echo "")
 
-          if [[ -z "$CURRENT_BASE" ]]; then
-            # Fallback: timestamp comparison
-            CURRENT_CREATED=$(skopeo inspect "docker://${CURRENT_IMAGE}" 2>/dev/null | jq -r '.Created' || echo "")
-            BASE_CREATED=$(skopeo inspect "docker://${BASE_IMAGE}" 2>/dev/null | jq -r '.Created' || echo "")
-            CE=$(date -d "$CURRENT_CREATED" +%s 2>/dev/null || echo "0")
-            BE=$(date -d "$BASE_CREATED"    +%s 2>/dev/null || echo "0")
-            [[ $BE -gt $CE ]] && echo "updated=true" >> "$GITHUB_OUTPUT" \
-                              || echo "updated=false" >> "$GITHUB_OUTPUT"
+          if [[ -z "$PREV_HASH" ]]; then
+            # No prior hash label — conservative: treat as not updated, first
+            # build after this change will set the label for future comparisons.
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "No prior base.digest label found — will populate on next build"
+          elif [[ "$PREV_HASH" != "$CURRENT_HASH" ]]; then
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "🔄 Base images changed (prev=$PREV_HASH, cur=$CURRENT_HASH)"
           else
-            [[ "$CURRENT_BASE" != "$BASE_DIGEST" ]] \
-              && echo "updated=true"  >> "$GITHUB_OUTPUT" \
-              || echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Base images unchanged"
           fi
 
       - name: Check 5-day stable promotion eligibility
@@ -548,6 +574,222 @@ jobs:
             echo "Not yet eligible ($DAYS_AS_LATEST days < 5 days required)"
           fi
 
+      # ── Discover missing upstream releases (auto-check only) ──────────────
+      # Lists non-prerelease, non-draft release tags on the upstream repo,
+      # diffs them against GHCR, and emits a JSON array of versions missing
+      # from the registry. cron-jobs.org can then call auto-check daily and
+      # the workflow will auto-build any newly published upstream release
+      # without manual intervention.
+      - name: Discover missing upstream releases
+        id: discover-releases
+        if: steps.set-action.outputs.action == 'auto-check'
+        env:
+          FORCE_TAG: ${{ github.event.inputs.force_release_tag }}
+        run: |
+          # Retry-tolerant skopeo inspect (Docker Hub rate-limits are common on
+          # large release lists; GHCR has no anon rate limit for auth callers).
+          rl_inspect() {
+            local ref="$1" attempt
+            for attempt in 1 2 3; do
+              if skopeo inspect "docker://${ref}" &>/dev/null; then echo yes; return 0; fi
+              [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+            done
+            echo no
+          }
+
+          # gh CLI has built-in retry + token auth from GH_TOKEN.
+          ALL_VERS=$(GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release list \
+            --repo FreePeak/db-mcp-server \
+            --limit 100 \
+            --exclude-drafts --exclude-pre-releases \
+            --json tagName \
+            --jq '.[].tagName' 2>/dev/null \
+            | sed 's/^v//' | sort -V || echo "")
+
+          if [[ -z "$ALL_VERS" ]]; then
+            echo "::warning::Upstream release list fetch failed — skipping release discovery"
+            echo "missing_releases_json=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # FORCE_TAG comes through env: to avoid shell injection if a user
+          # pastes metachars into the workflow_dispatch input field.
+          MISSING=()
+          while IFS= read -r ver; do
+            [[ -z "$ver" ]] && continue
+            # Force-tag bypass: unconditionally enqueue the requested version
+            # (must still exist upstream to land here).
+            if [[ -n "$FORCE_TAG" && "$ver" == "$FORCE_TAG" ]]; then
+              MISSING+=("$ver")
+              echo "  ⚡ $ver force-rebuild requested"
+              continue
+            fi
+            EXISTS=$(rl_inspect "${{ env.GHCR_REPO }}:${ver}")
+            if [[ "$EXISTS" == "no" ]]; then
+              MISSING+=("$ver")
+              echo "  ➕ $ver not in GHCR — will build"
+            fi
+          done <<< "$ALL_VERS"
+
+          # Validate force_release_tag matched an actual upstream release
+          if [[ -n "$FORCE_TAG" ]]; then
+            FOUND=0
+            for m in "${MISSING[@]}"; do [[ "$m" == "$FORCE_TAG" ]] && FOUND=1; done
+            if [[ "$FOUND" == "0" ]]; then
+              echo "::error::force_release_tag=$FORCE_TAG did not match any upstream release"
+              exit 1
+            fi
+          fi
+
+          if [[ ${#MISSING[@]} -eq 0 ]]; then
+            echo "✅ All upstream releases already present in GHCR"
+            echo "missing_releases_json=[]" >> "$GITHUB_OUTPUT"
+          else
+            JSON=$(printf '%s\n' "${MISSING[@]}" | jq -R . | jq -sc .)
+            echo "missing_releases_json=$JSON" >> "$GITHUB_OUTPUT"
+            echo "🔨 Missing releases: ${MISSING[*]}"
+          fi
+
+      # ── Resolve nightly candidate (auto-check only) ────────────────────────
+      # Compares upstream default-branch HEAD against:
+      #   1. Every release tag SHA — skip if HEAD is already a tagged commit
+      #      (that commit gets built via discover-releases as :X.Y.Z instead).
+      #   2. Current :nightly label org.opencontainers.image.revision — skip
+      #      if already published as the latest nightly.
+      # git ls-remote over smart-HTTP avoids the GitHub REST unauthenticated
+      # rate limit (~60/hr/IP) and handles annotated tags uniformly via the
+      # ^{} peel line (dereferenced commit SHA).
+      - name: Resolve nightly candidate
+        id: resolve-nightly
+        if: steps.set-action.outputs.action == 'auto-check'
+        env:
+          SKIP_NIGHTLY_SHAS: ${{ vars.SKIP_NIGHTLY_SHAS }}
+          FORCE_NIGHTLY: ${{ github.event.inputs.force_nightly }}
+          SHA_OVERRIDE:  ${{ github.event.inputs.nightly_sha_override }}
+          ALLOW_ON_RELEASE: ${{ github.event.inputs.allow_nightly_on_release_commit }}
+        run: |
+
+          # Retry-tolerant ls-remote HEAD — transient DNS/TLS blips shouldn't
+          # silently skip nightly for the whole cron tick.
+          resolve_head() {
+            local attempt sha
+            for attempt in 1 2 3; do
+              sha=$(git ls-remote https://github.com/FreePeak/db-mcp-server.git HEAD 2>/dev/null | awk '{print $1}')
+              if [[ -n "$sha" ]]; then echo "$sha"; return 0; fi
+              [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+            done
+            return 1
+          }
+
+          # Priority: override > HEAD
+          if [[ -n "$SHA_OVERRIDE" ]]; then
+            if [[ ! "$SHA_OVERRIDE" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::nightly_sha_override must be a 40-char commit SHA"
+              exit 1
+            fi
+            CANDIDATE_SHA="${SHA_OVERRIDE,,}"
+            echo "⚡ Nightly SHA override: $CANDIDATE_SHA"
+          else
+            if ! CANDIDATE_SHA=$(resolve_head); then
+              echo "::warning::Could not resolve upstream HEAD after 3 attempts — skipping nightly"
+              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
+              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=ls-remote HEAD failed" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Upstream HEAD: $CANDIDATE_SHA"
+          fi
+
+          # Skip-list check (repo variable SKIP_NIGHTLY_SHAS, comma-separated).
+          # Operator escape hatch for known-bad commits — overrides even force_nightly
+          # to prevent accidental rebuilds. Always honored.
+          # Each entry must be >=12 hex chars to avoid short-SHA prefix collisions.
+          if [[ -n "$SKIP_NIGHTLY_SHAS" ]]; then
+            IFS=',' read -ra SKIP_ARR <<< "$SKIP_NIGHTLY_SHAS"
+            for s in "${SKIP_ARR[@]}"; do
+              s=$(echo "$s" | xargs)
+              [[ -z "$s" ]] && continue
+              if [[ ! "$s" =~ ^[0-9a-fA-F]{12,40}$ ]]; then
+                echo "::error::SKIP_NIGHTLY_SHAS entry '$s' must be 12-40 hex chars (prevents short-SHA collisions)"
+                exit 1
+              fi
+              s_lc="${s,,}"
+              cand_lc="${CANDIDATE_SHA,,}"
+              # Full-length exact match OR candidate starts with the configured prefix.
+              if [[ "$cand_lc" == "$s_lc"* ]]; then
+                echo "⛔ Nightly SHA $CANDIDATE_SHA matches SKIP_NIGHTLY_SHAS entry '$s' — skipping"
+                echo "nightly_sha="       >> "$GITHUB_OUTPUT"
+                echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
+                echo "skip_reason=SHA in SKIP_NIGHTLY_SHAS repo variable" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+          fi
+
+          # Tag-match check ALWAYS runs unless allow_nightly_on_release_commit=true
+          # was explicitly set. force_nightly alone is not enough — that flag is
+          # for retrying a failed nightly on the same HEAD, not for rebuilding
+          # a release commit under the nightly tag (which would ship bit-
+          # identical content as both :X.Y.Z and :nightly-DATE-SHORT, confusing
+          # downstream consumers). skip-list check above is also not bypassable.
+          # Fetch ls-remote --tags with retry; fail-closed if we genuinely
+          # can't reach upstream so a release-commit doesn't slip through as
+          # nightly due to a transient network blip.
+          TAGS_RAW=""
+          for attempt in 1 2 3; do
+            TAGS_RAW=$(git ls-remote --tags https://github.com/FreePeak/db-mcp-server.git 2>/dev/null) && [[ -n "$TAGS_RAW" ]] && break
+            [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+          done
+          if [[ -z "$TAGS_RAW" ]]; then
+            echo "::error::Could not fetch upstream tag list after 3 attempts — refusing to build nightly without release-commit check"
+            exit 1
+          fi
+
+          # Dereferenced tag SHAs via peel lines. For annotated tags, the
+          # ^{} entry carries the commit SHA; for lightweight tags only the
+          # direct entry exists. This awk keeps the commit SHA in both cases.
+          TAG_SHAS=$(echo "$TAGS_RAW" \
+            | awk '/\^\{\}$/ { tags[$2]=$1; next } { if (!($2 in tags)) tags[$2]=$1 } END { for (t in tags) print tags[t] }' \
+            | sort -u)
+
+          if echo "$TAG_SHAS" | grep -qxF "$CANDIDATE_SHA"; then
+            MATCHED_TAG=$(echo "$TAGS_RAW" \
+              | awk -v s="$CANDIDATE_SHA" '$1==s && $2 !~ /\^\{\}$/ { sub("refs/tags/","",$2); print $2 }' \
+              | head -1)
+            if [[ "$ALLOW_ON_RELEASE" == "true" ]]; then
+              echo "⚠ HEAD matches release tag $MATCHED_TAG — allowed via allow_nightly_on_release_commit"
+            else
+              echo "⏭️  HEAD matches release tag: $MATCHED_TAG — skipping nightly"
+              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
+              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=HEAD matches release tag $MATCHED_TAG" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # force_nightly bypasses only the :nightly label-match check (so the
+          # same SHA can be rebuilt if last run failed). Everything above this
+          # point is still enforced.
+          if [[ "$FORCE_NIGHTLY" != "true" ]]; then
+            NIGHTLY_REV=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:nightly" 2>/dev/null \
+              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' || echo "")
+            if [[ -n "$NIGHTLY_REV" && "$NIGHTLY_REV" == "$CANDIDATE_SHA" ]]; then
+              echo "⏭️  HEAD already published as :nightly — skipping"
+              echo "nightly_sha="       >> "$GITHUB_OUTPUT"
+              echo "nightly_short_sha=" >> "$GITHUB_OUTPUT"
+              echo "skip_reason=HEAD already built as :nightly" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            echo "⚡ force_nightly=true — bypassing :nightly label-match check"
+          fi
+
+          SHORT="${CANDIDATE_SHA:0:7}"
+          echo "🌙 Nightly candidate: $CANDIDATE_SHA (short: $SHORT)"
+          echo "nightly_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          echo "nightly_short_sha=$SHORT"   >> "$GITHUB_OUTPUT"
+          echo "skip_reason="               >> "$GITHUB_OUTPUT"
+
       - name: Determine versions to build
         id: determine-versions
         run: |
@@ -567,48 +809,74 @@ jobs:
           case "$ACTION" in
             auto-check)
               COMMIT_PUBLISHED="${{ steps.check-existing.outputs.commit_published }}"
-              DH_CURRENT="${{ steps.check-existing.outputs.dockerhub_current }}"
-              GC_CURRENT="${{ steps.check-existing.outputs.ghcr_current }}"
+              MISSING_JSON='${{ steps.discover-releases.outputs.missing_releases_json }}'
+              NIGHTLY_SHA='${{ steps.resolve-nightly.outputs.nightly_sha }}'
+              NIGHTLY_REASON='${{ steps.resolve-nightly.outputs.skip_reason }}'
 
-              # Determine the version label to use for this build.
-              # Look up the current :latest version label on GHCR (not Docker Hub)
-              # to avoid manifest-GET pull-rate limits.
-              if [[ -n "$GIT_TAG_VERSION" ]]; then
-                BUILD_VER="$GIT_TAG_VERSION"
+              # Start from the set of release versions missing from GHCR.
+              ENTRIES="${MISSING_JSON:-[]}"
+              # jq-safety: if the step didn't run (e.g. set-action bypassed), default to []
+              echo "$ENTRIES" | jq . >/dev/null 2>&1 || ENTRIES='[]'
+
+              # Append nightly sentinel if HEAD is fresh and distinct from releases.
+              if [[ -n "$NIGHTLY_SHA" ]]; then
+                ENTRIES=$(echo "$ENTRIES" | jq -c '. + ["nightly"]')
+                echo "🌙 Nightly candidate enqueued ($NIGHTLY_SHA)"
+              elif [[ -n "$NIGHTLY_REASON" ]]; then
+                echo "🌙 Nightly skipped: $NIGHTLY_REASON"
+              fi
+
+              HAS_WORK=$(echo "$ENTRIES" | jq 'length')
+
+              # Renovate-pinned fallback: only runs when release + nightly paths
+              # produced nothing. Preserves historical auto-check behavior for
+              # legacy PR-merge triggers that don't carry release info.
+              if [[ "$HAS_WORK" == "0" ]]; then
+                # Resolve version label from current :latest on GHCR (no DH rate limit)
+                if [[ -n "$GIT_TAG_VERSION" ]]; then
+                  BUILD_VER="$GIT_TAG_VERSION"
+                else
+                  BUILD_VER=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
+                    | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
+                  [[ -z "$BUILD_VER" ]] && BUILD_VER="latest-from-source"
+                fi
+
+                SHOULD_FALLBACK="false"
+                if [[ "$COMMIT_PUBLISHED" == "true" && "$FORCE" != "true" ]]; then
+                  echo "⏭️  Commit ${{ env.UPSTREAM_REPO_SHA }} already published — no fallback build"
+                elif [[ "$COMMIT_PUBLISHED" == "partial" ]]; then
+                  echo "🔄 Commit published to one registry — fallback to sync the other"
+                  SHOULD_FALLBACK="true"
+                elif [[ "$COMMIT_PUBLISHED" == "false" ]]; then
+                  echo "🔨 Renovate SHA not yet published — fallback build"
+                  SHOULD_FALLBACK="true"
+                fi
+                [[ "$FORCE" == "true" ]] && { echo "⚡ Force build requested"; SHOULD_FALLBACK="true"; }
+                [[ "$BASE_UPDATED" == "true" && "$UPDATE_ENABLED" == "true" ]] && {
+                  echo "🔄 Base image updated — fallback rebuild"
+                  SHOULD_FALLBACK="true"
+                }
+
+                if [[ "$SHOULD_FALLBACK" == "true" ]]; then
+                  ENTRIES=$(jq -cn --arg v "$BUILD_VER" '[$v]')
+                fi
               else
-                BUILD_VER=$(skopeo inspect "docker://${{ env.GHCR_REPO }}:latest" 2>/dev/null \
-                  | jq -r '.Labels["org.opencontainers.image.version"] // empty' || echo "")
-                [[ -z "$BUILD_VER" ]] && BUILD_VER="latest-from-source"
+                echo "📦 Release-sync + nightly path active — Renovate fallback suppressed"
               fi
 
-              SHOULD="false"
-
-              # PRIMARY gate: commit SHA already in BOTH registries → hard skip
-              if [[ "$COMMIT_PUBLISHED" == "true" && "$FORCE" != "true" ]]; then
-                echo "⏭️  Commit ${{ env.UPSTREAM_REPO_SHA }} already published to both registries — SKIPPING"
-                SHOULD="false"
-
-              # Partial: commit in one registry only → build to sync the other
-              elif [[ "$COMMIT_PUBLISHED" == "partial" ]]; then
-                echo "🔄 Commit published to one registry — building to sync the other"
-                SHOULD="true"
-
-              # Not published yet → normal build
-              elif [[ "$COMMIT_PUBLISHED" == "false" ]]; then
-                echo "🔨 New commit — building"
-                SHOULD="true"
+              FINAL_LEN=$(echo "$ENTRIES" | jq 'length')
+              if [[ "$FINAL_LEN" -gt 0 ]]; then
+                CSV=$(echo "$ENTRIES" | jq -r 'join(",")')
+                echo "versions=$CSV"             >> "$GITHUB_OUTPUT"
+                echo "versions_json=$ENTRIES"    >> "$GITHUB_OUTPUT"
+                echo "should_build=true"         >> "$GITHUB_OUTPUT"
+                echo "🚀 Auto-check will build: $CSV"
+              else
+                echo "versions="           >> "$GITHUB_OUTPUT"
+                echo "versions_json=[]"    >> "$GITHUB_OUTPUT"
+                echo "should_build=false"  >> "$GITHUB_OUTPUT"
+                echo "✅ Nothing to build — registry is up to date"
               fi
-
-              # Override gates
-              [[ "$FORCE" == "true" ]] && { echo "⚡ Force build requested"; SHOULD="true"; }
-              [[ "$BASE_UPDATED" == "true" && "$UPDATE_ENABLED" == "true" ]] && {
-                echo "🔄 Base image updated — rebuilding"
-                SHOULD="true"
-              }
-
-              echo "versions=$BUILD_VER"           >> "$GITHUB_OUTPUT"
-              echo "versions_json=[\"$BUILD_VER\"]" >> "$GITHUB_OUTPUT"
-              echo "should_build=$SHOULD"           >> "$GITHUB_OUTPUT"
               ;;
 
             build-versions)
@@ -638,15 +906,23 @@ jobs:
                 END="${INPUT#*-}"
                 echo "Expanding range ${START}-${END} via FreePeak/db-mcp-server releases"
 
-                ALL_VERS=$(curl -sf \
-                  -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/FreePeak/db-mcp-server/releases?per_page=100" \
-                  | jq -r '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
-                  | sed 's/^v//' | sort -V)
+                # gh CLI has built-in retry on 5xx; wrap in 3-attempt loop for
+                # network / token hiccups on top.
+                ALL_VERS=""
+                for attempt in 1 2 3; do
+                  ALL_VERS=$(GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release list \
+                    --repo FreePeak/db-mcp-server \
+                    --limit 100 \
+                    --exclude-drafts --exclude-pre-releases \
+                    --json tagName \
+                    --jq '.[].tagName' 2>/dev/null \
+                    | sed 's/^v//' | sort -V) || ALL_VERS=""
+                  [[ -n "$ALL_VERS" ]] && break
+                  [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+                done
 
                 if [[ -z "$ALL_VERS" ]]; then
-                  echo "❌ Could not fetch upstream release list" >&2
+                  echo "❌ Could not fetch upstream release list after 3 attempts" >&2
                   exit 1
                 fi
 
@@ -702,7 +978,7 @@ jobs:
                 echo "versions_json=[]" >> "$GITHUB_OUTPUT"
                 echo "should_build=false" >> "$GITHUB_OUTPUT"
               else
-                JSON=$(echo "$FILTERED" | sed 's/,/","/g; s/^/["/; s/$/"]/') 
+                JSON=$(printf '%s\n' "$FILTERED" | tr ',' '\n' | jq -R . | jq -sc .)
                 echo "versions=$FILTERED"      >> "$GITHUB_OUTPUT"
                 echo "versions_json=$JSON"     >> "$GITHUB_OUTPUT"
                 echo "should_build=true"       >> "$GITHUB_OUTPUT"
@@ -728,8 +1004,15 @@ jobs:
             exit 0
           fi
 
-          # Build exclusion regex from comma-separated EXCLUDE_VERSIONS
-          EXCLUDE_PATTERN="$(echo "$EXCLUDE_VERSIONS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d' | paste -sd '|')"
+          # Build exclusion regex from comma-separated EXCLUDE_VERSIONS.
+          # Dots are regex-escaped so "1.8.0" only matches the literal version,
+          # not "1a8a0" or similar.
+          EXCLUDE_PATTERN="$(echo "$EXCLUDE_VERSIONS" \
+            | tr ',' '\n' \
+            | sed 's/^ *//; s/ *$//' \
+            | sed '/^$/d' \
+            | sed 's/\./\\./g' \
+            | paste -sd '|')"
 
           FILTERED=""
           EXCLUDED_COUNT=0
@@ -757,7 +1040,7 @@ jobs:
           fi
 
           # Rebuild JSON array
-          JSON=$(echo "$FILTERED" | sed 's/,/","/g; s/^/["/; s/$/"]/')
+          JSON=$(printf '%s\n' "$FILTERED" | tr ',' '\n' | jq -R . | jq -sc .)
           echo "versions=$FILTERED" >> "$GITHUB_OUTPUT"
           echo "versions_json=$JSON" >> "$GITHUB_OUTPUT"
           echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -813,6 +1096,40 @@ jobs:
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "Matrix: $(echo $MATRIX | jq length) entries"
 
+      # ── Probe base image mirrors once (build-platform reuses the output) ──
+      # GHCR mirror reachable from this runner is almost certainly reachable
+      # from every matrix runner too (GHCR is public). Self-hosted runners
+      # with restricted firewalls are the only edge case; they'd need to
+      # probe locally. For the normal GitHub-hosted case, this cuts 4 probes
+      # per matrix entry down to 4 probes total per workflow.
+      - name: Resolve base image refs
+        id: resolve-base-refs
+        run: |
+          probe() {
+            local desired="$1" label="$2"
+            if [[ -z "$desired" ]]; then echo ""; return; fi
+            if docker buildx imagetools inspect "$desired" >/dev/null 2>&1; then
+              echo "$desired"
+            else
+              local fallback="${desired##*/}"
+              echo "$label: '$desired' unreachable — falling back to '$fallback'" >&2
+              echo "$fallback"
+            fi
+          }
+          HAPROXY_REF=$(probe "${{ env.HAPROXY_IMAGE }}"       "HAProxy")
+          BUILDER_REF=$(probe "${{ env.BASE_IMAGE_BUILDER }}"  "Builder")
+          RUNTIME_REF=$(probe "${{ env.BASE_IMAGE_RUNTIME }}"  "Runtime")
+          XX_REF=$(probe      "${{ env.XX_IMAGE }}"            "xx")
+          echo "haproxy=$HAPROXY_REF" >> "$GITHUB_OUTPUT"
+          echo "builder=$BUILDER_REF" >> "$GITHUB_OUTPUT"
+          echo "runtime=$RUNTIME_REF" >> "$GITHUB_OUTPUT"
+          echo "xx=$XX_REF"           >> "$GITHUB_OUTPUT"
+          echo "Resolved base refs:"
+          echo "  haproxy → $HAPROXY_REF"
+          echo "  builder → $BUILDER_REF"
+          echo "  runtime → $RUNTIME_REF"
+          echo "  xx      → $XX_REF"
+
       - name: Preflight summary
         run: |
           {
@@ -862,7 +1179,7 @@ jobs:
       fail-fast: false
       max-parallel: 20
       matrix:
-        include: ${{ fromJson(needs.check-releases.outputs.build_matrix) }}
+        include: ${{ fromJson(needs.check-releases.outputs.build_matrix || '[]') }}
 
     steps:
       - name: Checkout
@@ -870,20 +1187,54 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Clone upstream source at the pinned SHA ────────────────────────────
-      # UPSTREAM_REPO_SHA is tracked by Renovate — Merging a Renovate PR
-      # updates this SHA and triggers a fresh build of the new upstream commit.
+      # ── Clone upstream source ──────────────────────────────────────────────
+      # Checkout rule — driven by matrix.version shape, independent of action_type:
+      #   • semver "X.Y.Z"      → git tag "v${X.Y.Z}"          (release build)
+      #   • "nightly"            → needs.check-releases.outputs.nightly_sha
+      #                            (upstream default-branch HEAD at check time)
+      #   • "latest-from-source" → env.UPSTREAM_REPO_SHA        (Renovate-pinned)
+      #   • anything else        → env.UPSTREAM_REPO_SHA        (defensive fallback)
+      # RESOLVED_SHA is the canonical commit the image was actually built from.
+      # Downstream steps (labels, VCS_REF, cache-ref) consume the step output,
+      # not env.UPSTREAM_REPO_SHA, so per-entry images get correct revisions.
       - name: Clone upstream source
+        id: upstream
+        # User/upstream-controlled strings pass through env: (bash parses them
+        # as ordinary values) instead of GHA template substitution directly
+        # into the run: body, which would make shell metachars executable.
+        env:
+          VERSION: ${{ matrix.version }}
+          NIGHTLY_SHA: ${{ needs.check-releases.outputs.nightly_sha }}
+          PINNED_SHA: ${{ env.UPSTREAM_REPO_SHA }}
         run: |
           git clone https://github.com/FreePeak/db-mcp-server.git upstream
           cd upstream
-          git checkout ${{ env.UPSTREAM_REPO_SHA }}
-          echo "✅ Checked out upstream @ ${{ env.UPSTREAM_REPO_SHA }}"
+
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            CHECKOUT_REF="v${VERSION}"
+            echo "📌 release build — checking out upstream tag $CHECKOUT_REF"
+          elif [[ "$VERSION" == "nightly" ]]; then
+            if [[ ! "$NIGHTLY_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "❌ matrix.version=nightly but nightly_sha is not a 40-char hex SHA ('${NIGHTLY_SHA}')" >&2
+              exit 1
+            fi
+            CHECKOUT_REF="$NIGHTLY_SHA"
+            echo "🌙 nightly build — checking out HEAD SHA $CHECKOUT_REF"
+          else
+            CHECKOUT_REF="$PINNED_SHA"
+            echo "📌 Renovate-pinned — checking out SHA $CHECKOUT_REF"
+          fi
+
+          git checkout "$CHECKOUT_REF"
+          RESOLVED_SHA=$(git rev-parse HEAD)
+          echo "✅ Checked out upstream @ $CHECKOUT_REF ($RESOLVED_SHA)"
+
           mkdir -p ./resources
           cp ../resources/entrypoint.sh ../resources/banner.sh ../resources/haproxy.cfg.template ./resources/
           echo "✅ Injected overlay files into upstream build context"
-          echo "upstream_sha=${{ env.UPSTREAM_REPO_SHA }}" >> "$GITHUB_OUTPUT"
-        id: upstream
+
+          echo "upstream_sha=$RESOLVED_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
 
       # ── Free runner disk space (mirrors docker-build.yml) ─────────────────
       - name: Free disk space
@@ -924,7 +1275,6 @@ jobs:
 
       # ── Cache warming (mirrors warm_build_cache) ───────────────────────────
       - name: Warm build cache
-        if: github.event_name != 'pull_request'
         continue-on-error: true
         run: |
           for img in golang:1.24-alpine alpine:latest debian:bookworm-slim; do
@@ -935,16 +1285,30 @@ jobs:
       # Uses custom_tag if provided, otherwise auto-generates YYYYMMDD-<sha>
       - name: Compute build tag
         id: build-tag
+        env:
+          TZ_VAL: ${{ env.TZ }}
+          RESOLVED_SHA: ${{ steps.upstream.outputs.upstream_sha }}
+          CUSTOM: ${{ github.event.inputs.custom_tag }}
+          VERSION: ${{ matrix.version }}
         run: |
-          DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
-          SHORT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
-          SHORT_SHA="${SHORT_SHA:0:7}"
+          DATE=$(TZ="$TZ_VAL" date +"%Y%m%d")
+          SHORT_SHA="${RESOLVED_SHA:0:7}"
           AUTO_TAG="${DATE}-${SHORT_SHA}"
 
-          CUSTOM="${{ github.event.inputs.custom_tag }}"
+          # Primary tag precedence:
+          #   1. custom_tag input (explicit override) — always wins
+          #   2. semver matrix entry (release build) — use version as primary
+          #   3. nightly sentinel — "nightly-YYYYMMDD-<short>" immutable tag
+          #   4. Renovate/fallback — DATE-SHA auto tag
           if [[ -n "$CUSTOM" ]]; then
             PRIMARY="$CUSTOM"
             echo "🏷️  Using custom tag: $PRIMARY"
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            PRIMARY="$VERSION"
+            echo "🏷️  Release primary tag: $PRIMARY (auto: $AUTO_TAG)"
+          elif [[ "$VERSION" == "nightly" ]]; then
+            PRIMARY="nightly-${DATE}-${SHORT_SHA}"
+            echo "🌙 Nightly primary tag: $PRIMARY"
           else
             PRIMARY="$AUTO_TAG"
             echo "🏷️  Using auto-generated tag: $PRIMARY"
@@ -982,19 +1346,32 @@ jobs:
             org.opencontainers.image.created=${{ steps.build-tag.outputs.date }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.upstream.repo=https://github.com/FreePeak/db-mcp-server
-            org.opencontainers.image.upstream.revision=${{ env.UPSTREAM_REPO_SHA }}
+            org.opencontainers.image.upstream.revision=${{ steps.upstream.outputs.upstream_sha }}
+            org.opencontainers.image.upstream.ref=${{ steps.upstream.outputs.upstream_ref }}
             org.opencontainers.image.documentation=https://github.com/FreePeak/db-mcp-server
-            org.opencontainers.image.revision=${{ env.UPSTREAM_REPO_SHA }}
+            org.opencontainers.image.revision=${{ steps.upstream.outputs.upstream_sha }}
+            org.opencontainers.image.base.digest=${{ needs.check-releases.outputs.base_combined_digest }}
 
       # ── Get base image digest for change-tracking label ───────────────────
+      # Target the runtime stage (final FROM line), not the first FROM —
+      # first FROM is the xx cross-compile helper, whose digest isn't what
+      # runtime security scans and base-digest tracking should track.
       - name: Get base image digest
         id: base-digest
         run: |
-          BASE=$(grep -m1 '^FROM' Dockerfile | awk '{print $2}')
+          # Ignore FROM lines that reference other build stages by alias
+          # (`FROM builder`, `FROM haproxy-src`) — we only want real images.
+          BASE=$(awk '
+            /^FROM / {
+              img=$2
+              if (img ~ /^--platform/) img=$3
+              if (img ~ /[:\/]/) last=img
+            }
+            END { print last }' Dockerfile)
           DIG=$(skopeo inspect "docker://${BASE}" 2>/dev/null | jq -r '.Digest' || echo "unknown")
           echo "digest=$DIG"   >> "$GITHUB_OUTPUT"
           echo "image=$BASE"   >> "$GITHUB_OUTPUT"
-          echo "Base: $BASE @ $DIG"
+          echo "Base (runtime): $BASE @ $DIG"
 
       # ── Platform-scoped cache ref ──────────────────────────────────────────
       - name: Determine cache ref
@@ -1020,70 +1397,39 @@ jobs:
           echo "Version:     ${{ matrix.version }}"
           echo "Timeout:     ${{ needs.check-releases.outputs.build_timeout_min }}min"
 
-      # ── Resolve base images (GHCR mirrors with Docker Hub fallback) ───────
-      # Swap every FROM in ./Dockerfile that has a mirrored counterpart.
-      # Each candidate is probed with `docker buildx imagetools inspect`; if the
-      # GHCR mirror is unreachable, the original Docker Hub short name is kept.
-      # This drastically cuts Docker Hub manifest GETs (and thus 429s) on large
-      # matrix builds without breaking local developer builds that have no
-      # access to the GHCR mirror namespace.
+      # ── Swap FROM lines to pre-resolved base refs ─────────────────────────
+      # check-releases already probed each base image once and published the
+      # chosen ref (GHCR mirror or Docker Hub fallback). This step only has
+      # to sed-swap; no network probes per matrix entry. Uses # as sed
+      # delimiter so the ERE | alternation in each pattern parses cleanly.
       - name: Resolve base images
         id: base-images
+        env:
+          HAPROXY_REF: ${{ needs.check-releases.outputs.base_ref_haproxy }}
+          BUILDER_REF: ${{ needs.check-releases.outputs.base_ref_builder }}
+          RUNTIME_REF: ${{ needs.check-releases.outputs.base_ref_runtime }}
+          XX_REF:      ${{ needs.check-releases.outputs.base_ref_xx }}
         run: |
           set -euo pipefail
 
-          resolve_and_swap() {
-            local desired="$1"   # GHCR mirror (or Hub short-name if no mirror var)
-            local pattern="$2"   # regex matching FROM target in Dockerfile
-            local label="$3"     # human label for logs
-
-            if [[ -z "$desired" ]]; then
-              echo "⚠ $label: no image configured, skipping"
+          swap() {
+            local chosen="$1" pattern="$2" label="$3"
+            if [[ -z "$chosen" ]]; then
+              echo "⚠ $label: no ref configured, skipping"
               return 0
             fi
-
-            local chosen="$desired"
-            if ! docker buildx imagetools inspect "$desired" >/dev/null 2>&1; then
-              local fallback="${desired##*/}"
-              echo "$label: '$desired' unreachable — falling back to Docker Hub '$fallback'"
-              chosen="$fallback"
-            fi
-
             if grep -qE "$pattern" ./Dockerfile; then
-              # Use # as sed delimiter — image refs never contain '#', and the
-              # pattern uses '|' for ERE alternation so it cannot also be sed's
-              # separator (would be parsed as end-of-search).
-              sed -i -E "s#${pattern}#${chosen}#" ./Dockerfile
+              sed -i -E "s#$pattern#${chosen}#" ./Dockerfile
               echo "$label: swapped to $chosen"
             else
-              echo "$label: pattern '$pattern' not found in Dockerfile — no-op"
+              echo "$label: pattern '$pattern' not found — no-op"
             fi
           }
 
-          # haproxy-src — matches `FROM haproxy:lts-alpine` or a GHCR mirror tag
-          resolve_and_swap \
-            "${{ env.HAPROXY_IMAGE }}" \
-            'haproxy:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/haproxy:[A-Za-z0-9._-]+' \
-            "HAProxy"
-
-          # builder — golang:alpine (or GHCR mirror)
-          resolve_and_swap \
-            "${{ env.BASE_IMAGE_BUILDER }}" \
-            'golang:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/golang:[A-Za-z0-9._-]+' \
-            "Builder (golang)"
-
-          # runtime — alpine:latest (or GHCR mirror). Match only the 2nd-stage
-          # `FROM alpine:...`; the haproxy-src stage is already replaced above.
-          resolve_and_swap \
-            "${{ env.BASE_IMAGE_RUNTIME }}" \
-            'alpine:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/alpine:[A-Za-z0-9._-]+' \
-            "Runtime (alpine)"
-
-          # xx helper — tonistiigi/xx:<tag> (or GHCR mirror)
-          resolve_and_swap \
-            "${{ env.XX_IMAGE }}" \
-            'tonistiigi/xx:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/tonistiigi/xx:[A-Za-z0-9._-]+' \
-            "xx (cross-compile helper)"
+          swap "$HAPROXY_REF" 'haproxy:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/haproxy:[A-Za-z0-9._-]+' "HAProxy"
+          swap "$BUILDER_REF" 'golang:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/golang:[A-Za-z0-9._-]+' "Builder (golang)"
+          swap "$RUNTIME_REF" 'alpine:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/alpine:[A-Za-z0-9._-]+' "Runtime (alpine)"
+          swap "$XX_REF"      'tonistiigi/xx:[A-Za-z0-9._-]+|ghcr\.io/[A-Za-z0-9._/-]+/tonistiigi/xx:[A-Za-z0-9._-]+' "xx (cross-compile helper)"
 
           echo "─── Final FROM lines ──────────────────────────────"
           grep -nE "^FROM" ./Dockerfile
@@ -1112,7 +1458,7 @@ jobs:
             BUILDKIT_MULTI_PLATFORM=1
             BUILDKIT_MAX_PARALLELISM=${{ steps.resources.outputs.opt_cpu }}
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
-            VCS_REF=${{ env.UPSTREAM_REPO_SHA }}
+            VCS_REF=${{ steps.upstream.outputs.upstream_sha }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
           # GHA cache primary + GHCR registry cache fallback (zstd compression)
           cache-from: |
@@ -1121,16 +1467,14 @@ jobs:
           cache-to: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }}
             type=registry,ref=${{ env.GHCR_REPO }}:${{ steps.cache-ref.outputs.cache_tag }},mode=max,compression=zstd,compression-level=${{ needs.check-releases.outputs.compression_level }},image-manifest=true,oci-mediatypes=true
-          # Push by digest — tags applied in merge-manifest job
+          # Push by digest — tags applied in merge-manifest job.
           outputs: >-
             ${{
-              github.event_name == 'pull_request'
-              && 'type=cacheonly'
-              || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
+              format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
                     (github.event.inputs.push_to_ghcr != 'false' && env.GHCR_REPO || env.DOCKERHUB_REPO),
-                   needs.check-releases.outputs.compression_params,
-                   env.EXPORT_CACHE_CONCURRENCY,
-                   env.EXPORT_LAYERS_CONCURRENCY)
+                    needs.check-releases.outputs.compression_params,
+                    env.EXPORT_CACHE_CONCURRENCY,
+                    env.EXPORT_LAYERS_CONCURRENCY)
             }}
 
       # ── Build end monitoring + summary ────────────────────────────────────
@@ -1167,14 +1511,12 @@ jobs:
 
       # ── Save digest ────────────────────────────────────────────────────────
       - name: Export digest
-        if: github.event_name != 'pull_request'
         run: |
           mkdir -p /tmp/digests
           DIGEST="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: digest-${{ matrix.version }}-${{ matrix.platform_slug }}
@@ -1188,7 +1530,14 @@ jobs:
   merge-manifest:
     name: Merge Manifest ${{ matrix.version }}
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
-    if: ${{ !cancelled() && needs.check-releases.result == 'success' && needs.build-platform.result == 'success' }}
+    # Per-version gate: proceed whenever check-releases succeeded and at least
+    # one platform produced a digest for THIS version. Avoids killing good
+    # versions because an unrelated version's arm64 build flaked. The
+    # download-digests step has continue-on-error, so missing-artifacts land
+    # in check-digests → has_digests=false, and every downstream step is
+    # already guarded on has_digests. fail-fast: false on the matrix below
+    # prevents one version's failure from cancelling siblings.
+    if: ${{ !cancelled() && needs.check-releases.result == 'success' && needs.build-platform.result != 'cancelled' }}
     needs: [check-releases, build-platform]
 
     permissions:
@@ -1202,7 +1551,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ${{ fromJson(needs.check-releases.outputs.versions_json) }}
+        version: ${{ fromJson(needs.check-releases.outputs.versions_json || '[]') }}
 
     steps:
       - name: Download all platform digests for this version
@@ -1250,46 +1599,136 @@ jobs:
       - name: Determine image tags
         if: steps.check-digests.outputs.has_digests == 'true'
         id: tags
+        env:
+          TZ_VAL: ${{ env.TZ }}
+          VERSION: ${{ matrix.version }}
+          CUSTOM: ${{ github.event.inputs.custom_tag }}
+          TAG_AS_LATEST: ${{ github.event.inputs.tag_as_latest || 'true' }}
+          VERSIONS_JSON: ${{ needs.check-releases.outputs.versions_json }}
+          NIGHTLY_SHA_IN: ${{ needs.check-releases.outputs.nightly_sha }}
+          NIGHTLY_SHORT_IN: ${{ needs.check-releases.outputs.nightly_short_sha }}
+          PINNED_SHA: ${{ env.UPSTREAM_REPO_SHA }}
         run: |
-          DATE=$(TZ="${{ env.TZ }}" date +"%Y%m%d")
-          SHORT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
-          SHORT_SHA="${SHORT_SHA:0:7}"
+          DATE=$(TZ="$TZ_VAL" date +"%Y%m%d")
+
+          # Entry type is driven by matrix.version shape, not action_type.
+          IS_RELEASE_BUILD="false"
+          IS_NIGHTLY="false"
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IS_RELEASE_BUILD="true"
+          elif [[ "$VERSION" == "nightly" ]]; then
+            IS_NIGHTLY="true"
+          fi
+
+          # Resolve upstream commit SHA for this image:
+          # • Release → /git/refs/tags/v${VERSION} on FreePeak/db-mcp-server
+          # • Nightly → needs.check-releases.outputs.nightly_sha
+          # • Fallback → env.UPSTREAM_REPO_SHA
+          # merge-manifest does not clone, so release-mode SHA is fetched fresh.
+          if [[ "$IS_RELEASE_BUILD" == "true" ]]; then
+            # gh api resolves tag → commit transparently via /commits/{ref},
+            # so annotated tags return the dereferenced commit SHA (not the
+            # tag-object SHA that /git/refs/tags/* would yield).
+            RESOLVED_SHA=""
+            for attempt in 1 2 3; do
+              RESOLVED_SHA=$(GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh api \
+                "repos/FreePeak/db-mcp-server/commits/v${VERSION}" \
+                --jq .sha 2>/dev/null || echo "")
+              [[ -n "$RESOLVED_SHA" ]] && break
+              [[ $attempt -lt 3 ]] && sleep $(( attempt * 10 ))
+            done
+            if [[ -z "$RESOLVED_SHA" ]]; then
+              echo "::error::Could not resolve commit SHA for v${VERSION} after 3 attempts"
+              exit 1
+            fi
+          elif [[ "$IS_NIGHTLY" == "true" ]]; then
+            RESOLVED_SHA="$NIGHTLY_SHA_IN"
+          else
+            RESOLVED_SHA="$PINNED_SHA"
+          fi
+          SHORT_SHA="${RESOLVED_SHA:0:7}"
           AUTO_TAG="${DATE}-${SHORT_SHA}"
 
-          # custom_tag replaces the primary — auto tag still applied alongside it
-          CUSTOM="${{ github.event.inputs.custom_tag }}"
+          # Primary tag precedence:
+          #   1. custom_tag input — explicit user override
+          #   2. release → matrix.version (e.g. "1.9.0")
+          #   3. nightly → "nightly-YYYYMMDD-<short>"
+          #   4. fallback → DATE-SHA
           if [[ -n "$CUSTOM" ]]; then
             PRIMARY="$CUSTOM"
-            echo "🏷️  Custom tag: $PRIMARY (auto: $AUTO_TAG also applied)"
+            echo "🏷️  Custom tag: $PRIMARY"
+          elif [[ "$IS_RELEASE_BUILD" == "true" ]]; then
+            PRIMARY="$VERSION"
+            echo "🏷️  Release tag: $PRIMARY"
+          elif [[ "$IS_NIGHTLY" == "true" ]]; then
+            NSHORT="${NIGHTLY_SHORT_IN:-$SHORT_SHA}"
+            PRIMARY="nightly-${DATE}-${NSHORT}"
+            echo "🌙 Nightly tag: $PRIMARY"
           else
             PRIMARY="$AUTO_TAG"
             echo "🏷️  Auto tag: $PRIMARY"
           fi
 
-          TAG_AS_LATEST="${{ github.event.inputs.tag_as_latest || 'true' }}"
+          DH_TAGS="-t ${{ env.DOCKERHUB_REPO }}:${PRIMARY}"
+          GC_TAGS="-t ${{ env.GHCR_REPO }}:${PRIMARY}"
 
-          # Always apply: primary + date-only
-          DH_TAGS="-t ${{ env.DOCKERHUB_REPO }}:${PRIMARY} -t ${{ env.DOCKERHUB_REPO }}:${DATE}"
-          GC_TAGS="-t ${{ env.GHCR_REPO }}:${PRIMARY}      -t ${{ env.GHCR_REPO }}:${DATE}"
-
-          # When custom tag is set, also apply the auto-generated tag so SHA traceability is preserved
-          if [[ -n "$CUSTOM" ]]; then
-            DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:${AUTO_TAG}"
-            GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:${AUTO_TAG}"
+          # Nightly floats :nightly and nothing else.
+          if [[ "$IS_NIGHTLY" == "true" ]]; then
+            DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:nightly"
+            GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:nightly"
           fi
 
-          # :latest — checkbox controls this
-          if [[ "$TAG_AS_LATEST" == "true" ]]; then
+          # :DATE and :DATE-SHA floats are only applied in non-release / non-nightly
+          # fallback mode — they would collide across heterogeneous matrix runs.
+          if [[ "$IS_RELEASE_BUILD" != "true" && "$IS_NIGHTLY" != "true" ]]; then
+            DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:${DATE}"
+            GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:${DATE}"
+            if [[ -n "$CUSTOM" ]]; then
+              DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:${AUTO_TAG}"
+              GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:${AUTO_TAG}"
+            fi
+          fi
+
+          # :latest rules:
+          #   • Nightly → never
+          #   • Release → only the highest semver in versions_json
+          #   • Fallback/Renovate → existing behavior (checkbox-gated), but
+          #     suppressed when any semver release is also in the matrix
+          #     (release takes precedence over Renovate-pinned SHA as :latest).
+          APPLY_LATEST="false"
+          if [[ "$TAG_AS_LATEST" == "true" && "$IS_NIGHTLY" != "true" ]]; then
+            SEMVERS=$(echo "$VERSIONS_JSON" | jq -r '.[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))' | sort -V)
+            HIGHEST_SEMVER=$(echo "$SEMVERS" | tail -1)
+            if [[ "$IS_RELEASE_BUILD" == "true" ]]; then
+              if [[ "$VERSION" == "$HIGHEST_SEMVER" ]]; then
+                APPLY_LATEST="true"
+                echo "🏷️  $VERSION is highest semver in matrix — applying :latest"
+              else
+                echo "⏭️  $VERSION < $HIGHEST_SEMVER — skipping :latest"
+              fi
+            else
+              # Fallback entry. Only take :latest if no semver release in matrix.
+              if [[ -z "$HIGHEST_SEMVER" ]]; then
+                APPLY_LATEST="true"
+                echo "🏷️  No semver in matrix — fallback entry takes :latest"
+              else
+                echo "⏭️  Semver release in matrix ($HIGHEST_SEMVER) — fallback skips :latest"
+              fi
+            fi
+          fi
+          if [[ "$APPLY_LATEST" == "true" ]]; then
             DH_TAGS="$DH_TAGS -t ${{ env.DOCKERHUB_REPO }}:latest"
             GC_TAGS="$GC_TAGS -t ${{ env.GHCR_REPO }}:latest"
           fi
 
-          echo "dockerhub_tags=$DH_TAGS" >> "$GITHUB_OUTPUT"
-          echo "ghcr_tags=$GC_TAGS"      >> "$GITHUB_OUTPUT"
-          echo "primary_tag=$PRIMARY"    >> "$GITHUB_OUTPUT"
-          echo "auto_tag=$AUTO_TAG"      >> "$GITHUB_OUTPUT"
-          echo "date_tag=$DATE"          >> "$GITHUB_OUTPUT"
-          echo "short_sha=$SHORT_SHA"    >> "$GITHUB_OUTPUT"
+          echo "dockerhub_tags=$DH_TAGS"  >> "$GITHUB_OUTPUT"
+          echo "ghcr_tags=$GC_TAGS"       >> "$GITHUB_OUTPUT"
+          echo "primary_tag=$PRIMARY"     >> "$GITHUB_OUTPUT"
+          echo "auto_tag=$AUTO_TAG"       >> "$GITHUB_OUTPUT"
+          echo "date_tag=$DATE"           >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA"     >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$RESOLVED_SHA" >> "$GITHUB_OUTPUT"
+          echo "is_nightly=$IS_NIGHTLY"   >> "$GITHUB_OUTPUT"
           echo "DH: $DH_TAGS"
           echo "GC: $GC_TAGS"
 
@@ -1315,11 +1754,16 @@ jobs:
             }
 
             echo "$OUTPUT"
+            # Longer backoff on 429 to actually let the bucket refill; short
+            # backoff on other transient failures.
             if echo "$OUTPUT" | grep -Eiq 'toomanyrequests|429 Too Many Requests'; then
               RATE_LIMITED=1
+              SLEEP=$(( attempt * 60 ))
+            else
+              SLEEP=$(( attempt * 10 ))
             fi
 
-            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 10))s..."; sleep $((attempt * 10)); }
+            [[ $attempt -lt 3 ]] && { echo "Retrying in ${SLEEP}s..."; sleep "$SLEEP"; }
           done
 
           if [[ $SUCCESS -eq 1 ]]; then
@@ -1339,8 +1783,20 @@ jobs:
           SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
-            docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES && break
-            [[ $attempt -lt 3 ]] && { echo "Retrying in $((attempt * 15))s..."; sleep $((attempt * 15)); } || exit 1
+            OUTPUT=$(docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES 2>&1) && { echo "$OUTPUT"; break; }
+            echo "$OUTPUT"
+            # GHCR has higher rate limits but can still 429 under heavy matrix
+            # load; use longer backoff when the server tells us to slow down.
+            if echo "$OUTPUT" | grep -Eiq 'toomanyrequests|429 Too Many Requests'; then
+              SLEEP=$(( attempt * 60 ))
+            else
+              SLEEP=$(( attempt * 15 ))
+            fi
+            if [[ $attempt -lt 3 ]]; then
+              echo "Retrying in ${SLEEP}s..."; sleep "$SLEEP"
+            else
+              exit 1
+            fi
           done
 
       - name: Inspect final manifest
@@ -1357,7 +1813,7 @@ jobs:
       - name: Trivy vulnerability scan
         id: trivy-scan
         if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.run_security_scan != 'false'
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@0.36.0
         with:
           image-ref: '${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}'
           format: sarif
@@ -1389,7 +1845,7 @@ jobs:
             echo "| Primary Tag | \`${{ steps.tags.outputs.primary_tag }}\` |"
             echo "| Date Tag | ${{ steps.tags.outputs.date_tag }} |"
             echo "| Short SHA | ${{ steps.tags.outputs.short_sha }} |"
-            echo "| Upstream Commit | ${{ env.UPSTREAM_REPO_SHA }} |"
+            echo "| Upstream Commit | ${{ steps.tags.outputs.upstream_sha || env.UPSTREAM_REPO_SHA }} |"
             echo "| Compression | ${{ needs.check-releases.outputs.compression_params }} |"
             echo "| Platforms | ${{ needs.check-releases.outputs.platforms }} |"
             echo ""
@@ -1532,8 +1988,14 @@ jobs:
     name: Mark Stable
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: [check-releases, merge-manifest, sync-registries]
+    # Promote only when upstream jobs didn't fail. For manual mark-stable, merge
+    # and sync may be skipped (no-build path) — treat `skipped` as acceptable.
     if: |
       always() &&
+      needs.merge-manifest.result   != 'failure' &&
+      needs.merge-manifest.result   != 'cancelled' &&
+      needs.sync-registries.result  != 'failure' &&
+      needs.sync-registries.result  != 'cancelled' &&
       (needs.check-releases.outputs.action_type == 'mark-stable' ||
        (needs.check-releases.outputs.action_type == 'auto-check' &&
         needs.check-releases.outputs.should_mark_stable == 'true'))
@@ -1669,7 +2131,7 @@ jobs:
     name: Cache Housekeeping
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: [check-releases, merge-manifest]
-    if: github.event_name != 'pull_request' && needs.merge-manifest.result == 'success'
+    if: needs.merge-manifest.result == 'success'
 
     steps:
       - name: Checkout
@@ -1718,8 +2180,8 @@ jobs:
 
   # ============================================================================
   # Job 9 — Update pipeline state (orphan branch approach)
-  # Records the last successfully built upstream SHA so quick-check can skip
-  # redundant pipeline runs.
+  # Records the last successfully built upstream SHAs per channel
+  # (renovate / nightly / release set) for observability and tooling.
   # ============================================================================
   update-state:
     name: Update Pipeline State
@@ -1740,44 +2202,81 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Write pipeline state
+        env:
+          VERSIONS_JSON: ${{ needs.check-releases.outputs.versions_json }}
+          NIGHTLY_SHA:   ${{ needs.check-releases.outputs.nightly_sha }}
+          PRIMARY_TAG:   ${{ needs.merge-manifest.outputs.primary_tag }}
         run: |
-          CURRENT_SHA="${{ env.UPSTREAM_REPO_SHA }}"
+          set -euo pipefail
+          RENOVATE_SHA="${{ env.UPSTREAM_REPO_SHA }}"
           NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-          # Read previous state before switching branches
-          PREV_SHA=""
+          # Classify what was actually built this run.
+          BUILT_RENOVATE=false
+          BUILT_NIGHTLY=false
+          BUILT_RELEASES_JSON='[]'
+          if [[ -n "$VERSIONS_JSON" ]] && echo "$VERSIONS_JSON" | jq . >/dev/null 2>&1; then
+            echo "$VERSIONS_JSON" | jq -e 'index("latest-from-source")' >/dev/null && BUILT_RENOVATE=true
+            echo "$VERSIONS_JSON" | jq -e 'index("nightly")'            >/dev/null && BUILT_NIGHTLY=true
+            BUILT_RELEASES_JSON=$(echo "$VERSIONS_JSON" \
+              | jq -c '[.[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]')
+          fi
+          echo "Run summary — renovate=$BUILT_RENOVATE nightly=$BUILT_NIGHTLY releases=$BUILT_RELEASES_JSON"
+
+          # Read previous state before switching branches.
+          PREV_RENOVATE_SHA=""
+          PREV_NIGHTLY_SHA=""
+          PREV_RELEASES_JSON='[]'
           PREV_LATEST_SHA_SINCE=""
           if git fetch origin pipeline-state --depth=1 2>/dev/null; then
-            PREV_SHA=$(git show origin/pipeline-state:last-built-sha 2>/dev/null || echo "")
-            PREV_LATEST_SHA_SINCE=$(git show origin/pipeline-state:latest-sha-since 2>/dev/null || echo "")
+            PREV_RENOVATE_SHA=$(git show origin/pipeline-state:last-built-renovate-sha 2>/dev/null || \
+                                git show origin/pipeline-state:last-built-sha          2>/dev/null || echo "")
+            PREV_NIGHTLY_SHA=$(git  show origin/pipeline-state:last-built-nightly-sha  2>/dev/null || echo "")
+            PREV_RELEASES_JSON=$(git show origin/pipeline-state:last-built-releases    2>/dev/null || echo "[]")
+            echo "$PREV_RELEASES_JSON" | jq . >/dev/null 2>&1 || PREV_RELEASES_JSON='[]'
+            PREV_LATEST_SHA_SINCE=$(git show origin/pipeline-state:latest-sha-since   2>/dev/null || echo "")
           fi
 
-          # Determine latest_sha_since: reset if SHA changed, preserve if same
-          if [[ "$CURRENT_SHA" != "$PREV_SHA" || -z "$PREV_LATEST_SHA_SINCE" ]]; then
+          # Advance per-channel keys only when that channel actually built.
+          NEW_RENOVATE_SHA="$PREV_RENOVATE_SHA"
+          NEW_NIGHTLY_SHA="$PREV_NIGHTLY_SHA"
+          NEW_RELEASES_JSON="$PREV_RELEASES_JSON"
+          [[ "$BUILT_RENOVATE" == "true" ]] && NEW_RENOVATE_SHA="$RENOVATE_SHA"
+          [[ "$BUILT_NIGHTLY"  == "true" && -n "$NIGHTLY_SHA" ]] && NEW_NIGHTLY_SHA="$NIGHTLY_SHA"
+          if [[ "$(echo "$BUILT_RELEASES_JSON" | jq 'length')" -gt 0 ]]; then
+            NEW_RELEASES_JSON=$(jq -cn --argjson prev "$PREV_RELEASES_JSON" \
+                                       --argjson cur  "$BUILT_RELEASES_JSON" \
+                                       '($prev + $cur) | unique | sort')
+          fi
+
+          # latest_sha_since tracks Renovate-channel continuity (drives :stable promotion).
+          if [[ "$NEW_RENOVATE_SHA" != "$PREV_RENOVATE_SHA" || -z "$PREV_LATEST_SHA_SINCE" ]]; then
             LATEST_SHA_SINCE="$NOW"
-            echo "SHA changed (${PREV_SHA:-none} -> $CURRENT_SHA) — resetting latest_sha_since to $NOW"
+            echo "Renovate SHA changed (${PREV_RENOVATE_SHA:-none} -> $NEW_RENOVATE_SHA) — resetting latest_sha_since"
           else
             LATEST_SHA_SINCE="$PREV_LATEST_SHA_SINCE"
-            echo "SHA unchanged ($CURRENT_SHA) — preserving latest_sha_since=$LATEST_SHA_SINCE"
+            echo "Renovate SHA unchanged — preserving latest_sha_since=$LATEST_SHA_SINCE"
           fi
 
-          # Create or update the pipeline-state orphan branch
-          git checkout pipeline-state 2>/dev/null || \
-            git checkout --orphan pipeline-state
-
-          # Clean working tree for orphan branch
+          git checkout pipeline-state 2>/dev/null || git checkout --orphan pipeline-state
           git rm -rf --ignore-unmatch . > /dev/null 2>&1 || true
 
-          echo "$CURRENT_SHA"    > last-built-sha
-          echo "$NOW"            > last-built-time
-          echo "${{ needs.merge-manifest.outputs.primary_tag }}" > last-built-tag
+          # Per-channel state files.
+          echo "$NEW_RENOVATE_SHA" > last-built-renovate-sha
+          echo "$NEW_NIGHTLY_SHA"  > last-built-nightly-sha
+          echo "$NEW_RELEASES_JSON" > last-built-releases
+          echo "$NOW"              > last-built-time
+          echo "$PRIMARY_TAG"      > last-built-tag
           echo "$LATEST_SHA_SINCE" > latest-sha-since
+          # Back-compat alias — older readers still consult last-built-sha.
+          echo "$NEW_RENOVATE_SHA" > last-built-sha
 
-          git add last-built-sha last-built-time last-built-tag latest-sha-since
+          git add last-built-renovate-sha last-built-nightly-sha last-built-releases \
+                  last-built-sha last-built-time last-built-tag latest-sha-since
           if ! git diff --cached --quiet; then
             git -c user.name="github-actions[bot]" \
                 -c user.email="github-actions[bot]@users.noreply.github.com" \
-                commit -m "pipeline-state: built $CURRENT_SHA (latest_since=$LATEST_SHA_SINCE)"
+                commit -m "pipeline-state: renovate=$NEW_RENOVATE_SHA nightly=${NEW_NIGHTLY_SHA:-none} releases=$NEW_RELEASES_JSON"
             git push origin pipeline-state
           else
             echo "No changes to pipeline state — skipping commit"
