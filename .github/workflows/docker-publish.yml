@@ -316,7 +316,6 @@ jobs:
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: resolve-profile
     outputs:
-      versions_to_build:  ${{ steps.filter-excluded.outputs.versions || steps.determine-versions.outputs.versions }}
       versions_json:      ${{ steps.filter-excluded.outputs.versions_json || steps.determine-versions.outputs.versions_json }}
       should_build:       ${{ steps.filter-excluded.outputs.should_build || steps.determine-versions.outputs.should_build }}
       build_matrix:       ${{ steps.generate-matrix.outputs.matrix }}
@@ -329,8 +328,6 @@ jobs:
       gc_keep_storage:    ${{ needs.resolve-profile.outputs.gc_keep_storage }}
       build_timeout_min:  ${{ needs.resolve-profile.outputs.build_timeout_min }}
       resource_limit_pct: ${{ needs.resolve-profile.outputs.resource_limit_pct }}
-      commit_published:   ${{ steps.check-existing.outputs.commit_published }}
-      head_sha_short:     ${{ steps.check-existing.outputs.head_sha_short }}
       base_combined_digest: ${{ steps.check-base-image.outputs.combined_digest }}
       # Pre-resolved base image refs (GHCR mirror if reachable, else Docker Hub
       # short name) — build-platform reuses these instead of re-probing per
@@ -1289,7 +1286,7 @@ jobs:
       - name: Warm build cache
         continue-on-error: true
         run: |
-          for img in golang:1.24-alpine alpine:latest debian:bookworm-slim; do
+          for img in golang:1.24-alpine alpine:latest; do
             docker pull "$img" &>/dev/null && echo "✅ $img" || echo "⚠️  $img (skip)"
           done
 
@@ -1456,7 +1453,7 @@ jobs:
       - name: Build and push by digest
         id: build
         uses: ./.github/actions/build-push-retry
-        timeout-minutes: ${{ fromJSON(needs.check-releases.outputs.build_timeout_min) }}
+        timeout-minutes: ${{ fromJSON(needs.check-releases.outputs.build_timeout_min || '60') }}
         with:
           context: ./upstream
           file: ./Dockerfile
