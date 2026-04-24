@@ -749,15 +749,30 @@ jobs:
             (
               cd "$SCRATCH" || { echo "::error::could not cd to scratch dir $SCRATCH"; exit 1; }
               git init --bare --quiet
-              # Depth 500 covers any realistic review window.
+              # Fetch main with generous depth for ancestry traversal AND the
+              # specific candidate commit — handles the case where CANDIDATE
+              # is on main but older than the shallow depth of a main fetch
+              # alone (would otherwise false-positive as "not on main").
               if ! git fetch --depth=500 --quiet \
                     https://github.com/FreePeak/db-mcp-server.git \
                     refs/heads/main:refs/heads/main 2>/dev/null; then
                 echo "::error::Could not fetch upstream main for on-main ancestry check"
                 exit 1
               fi
+              if ! git cat-file -e "$CANDIDATE_SHA" 2>/dev/null; then
+                # Candidate not in the 500-commit window of main — fetch it
+                # directly. If THIS fetch fails, the commit likely does not
+                # exist in the remote at all (or is on a non-main ref GitHub
+                # allows fetching).
+                if ! git fetch --depth=1 --quiet \
+                      https://github.com/FreePeak/db-mcp-server.git \
+                      "$CANDIDATE_SHA" 2>/dev/null; then
+                  echo "::error::$CANDIDATE_SHA does not exist in upstream repo — refusing nightly build"
+                  exit 1
+                fi
+              fi
               if ! git merge-base --is-ancestor "$CANDIDATE_SHA" refs/heads/main 2>/dev/null; then
-                echo "::error::$CANDIDATE_SHA is not on upstream main — refusing nightly build"
+                echo "::error::$CANDIDATE_SHA is not an ancestor of upstream main — refusing nightly build"
                 exit 1
               fi
             )
@@ -821,15 +836,34 @@ jobs:
           fi
 
           # Keep only strict semver (X.Y.Z). Excludes :latest, :stable, :nightly,
-          # :nightly-*, :sha-*, and any promotion pointers.
+          # :nightly-*, :sha-*, and any promotion pointers. Pre-release
+          # upstream tags (:X.Y.Z-rc1 etc.) are caught by gate 3 since we
+          # never publish them to GHCR for this image.
           RELEASE_TAGS=$(echo "$GHCR_TAGS_JSON" \
             | jq -r '.Tags[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))')
 
+          # Rate-limit/transient-error tolerant inspect. Fail-closed after
+          # retries so a flaky registry can never silently let a released
+          # SHA slip through as :nightly (would violate the core rule).
+          inspect_revision() {
+            local ref="$1" attempt out
+            for attempt in 1 2 3; do
+              out=$(skopeo inspect \
+                --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
+                "docker://${ref}" 2>/dev/null) && {
+                echo "$out" | jq -r '.Labels["org.opencontainers.image.revision"] // empty'
+                return 0
+              }
+              [[ $attempt -lt 3 ]] && sleep $(( attempt * 5 ))
+            done
+            return 1
+          }
+
           for T in $RELEASE_TAGS; do
-            REV=$(skopeo inspect \
-              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-              "docker://${{ env.GHCR_REPO }}:${T}" 2>/dev/null \
-              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' || echo "")
+            if ! REV=$(inspect_revision "${{ env.GHCR_REPO }}:${T}"); then
+              echo "::error::Could not inspect :$T after 3 attempts — refusing nightly build without complete release-label scan"
+              exit 1
+            fi
             if [[ -n "$REV" && "$REV" == "$CANDIDATE_SHA" ]]; then
               if [[ "$FORCE_BUILD" == "true" ]]; then
                 redirect_release "$T" "HEAD already published as :$T in GHCR"
@@ -842,12 +876,11 @@ jobs:
           # ── Gate 5: :nightly manifest label match ──────────────────────────
           # Only gate that force_nightly bypasses. Useful for retrying a failed
           # nightly on the same HEAD, or rebuilding when base-image-only
-          # changes invalidate the old layer digests.
+          # changes invalidate the old layer digests. Fail-open on inspect
+          # error here (unlike gate 4) because worst case is one wasted
+          # duplicate :nightly build, not a rule violation.
           if [[ "$FORCE_NIGHTLY" != "true" ]]; then
-            NIGHTLY_REV=$(skopeo inspect \
-              --creds "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" \
-              "docker://${{ env.GHCR_REPO }}:nightly" 2>/dev/null \
-              | jq -r '.Labels["org.opencontainers.image.revision"] // empty' || echo "")
+            NIGHTLY_REV=$(inspect_revision "${{ env.GHCR_REPO }}:nightly" || echo "")
             if [[ -n "$NIGHTLY_REV" && "$NIGHTLY_REV" == "$CANDIDATE_SHA" ]]; then
               skip "HEAD already built as :nightly (set force_nightly=true to retry)"
             fi
