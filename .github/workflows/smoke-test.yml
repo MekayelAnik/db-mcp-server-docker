@@ -85,10 +85,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install client tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client jq curl
+      # Cache apt packages across runs (~15-25s saved per smoke job)
+      - name: Install client tools (apt-cached)
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: postgresql-client jq curl
+          version: 1.0
 
       - name: Login to GHCR (read-only)
         uses: ./.github/actions/registry-login
@@ -97,6 +99,40 @@ jobs:
           ghcr_token:        ${{ secrets.ghcr_token != '' && secrets.ghcr_token || secrets.GITHUB_TOKEN }}
           push_to_dockerhub: 'false'
           push_to_ghcr:      'true'
+
+      # Begin pulling the image in the background while postgres service
+      # finishes warming up. The smoke script also calls `docker pull`, but
+      # that becomes a no-op once the image is cached locally. Saves ~30-50s
+      # of wall-clock time vs. doing the pull serially after postgres ready.
+      - name: Pre-pull dbmcp image (background)
+        env:
+          IMAGE_REF: ${{ inputs.image_ref }}
+        run: |
+          # nohup + setsid + double-fork to detach from the step shell so
+          # the pull keeps running while subsequent steps continue. PID is
+          # recorded on disk for later wait-step polling.
+          nohup setsid bash -c '
+            docker pull "'"$IMAGE_REF"'" > /tmp/prepull.log 2>&1
+            echo "EXIT=$?" >> /tmp/prepull.log
+          ' </dev/null >/dev/null 2>&1 &
+          echo $! > /tmp/prepull.pid
+          disown
+          echo "Pre-pull PID: $(cat /tmp/prepull.pid) (image: ${IMAGE_REF})"
+
+      - name: Wait for image pre-pull
+        run: |
+          # `wait` is shell-builtin and only works for children of the
+          # current shell. Across step boundaries we poll the recorded PID
+          # via `kill -0` instead. `tail --pid=PID -f /dev/null` blocks
+          # cleanly until the target exits.
+          PID=$(cat /tmp/prepull.pid 2>/dev/null || echo "")
+          if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+            tail --pid="$PID" -f /dev/null &
+            wait $!
+            echo "Pre-pull complete (PID $PID exited)"
+          else
+            echo "Pre-pull already finished"
+          fi
 
       - name: Run MCP smoke battery
         env:
