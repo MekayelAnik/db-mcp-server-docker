@@ -109,11 +109,13 @@
       "groupName": "github-actions-major"
     },
     {
-      "description": "TimescaleDB-HA pg<N> bump: PR only, no auto-merge — DB major bumps deserve human review (extension API, query planner changes, etc.)",
+      "description": "TimescaleDB-HA pg<N> bump: auto-merge — only used by the smoke-test infrastructure, never shipped in published images. Smoke battery itself acts as the regression gate; if it passes against the new pg<N>, the bump is safe to merge automatically.",
       "matchPackageNames": [
         "timescale/timescaledb-ha"
       ],
-      "automerge": false,
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
       "labels": [
         "dependencies",
         "smoke-test",
@@ -121,7 +123,7 @@
       ],
       "commitMessageTopic": "TimescaleDB ({{depName}})",
       "prBodyNotes": [
-        "**Smoke test impact:** This bumps the PostgreSQL+TimescaleDB version used by `.github/workflows/smoke-test.yml` and `.github/smoke/compose.yml`. Verify the smoke battery still passes against the new pg<N> image before merging — TimescaleDB sometimes drops/renames functions across major Postgres versions."
+        "**Smoke test impact:** This bumps the PostgreSQL+TimescaleDB version used by `.github/workflows/smoke-test.yml` and `.github/smoke/compose.yml`. Auto-merge is enabled — the smoke battery itself runs against the new image as part of CI; if every status check passes, the PR auto-merges. If a TimescaleDB API change breaks the battery, smoke fails and Renovate holds the PR open for manual fix."
       ]
     }
   ],
