@@ -61,11 +61,12 @@ RUN xx-apk add --no-cache musl-dev gcc
 
 WORKDIR /app
 
-# Cache dependency layer separately from source
-COPY go.mod go.sum ./
-RUN go mod download
-
+# Copy full source before \`go mod download\` so go.mod \`replace\` directives
+# pointing to in-tree paths (e.g. ./hack/mcp-go in v1.4.x) can resolve.
+# Trades the dep-layer caching benefit for correctness across every release
+# tag — buildx layer cache (cache-ref) still hits when source is unchanged.
 COPY . .
+RUN go mod download
 
 # xx-go sets GOOS, GOARCH, GOARM, CC, and CGO_ENABLED=1 automatically.
 RUN --mount=type=cache,target=/root/.cache/go-build \\

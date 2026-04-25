@@ -572,12 +572,16 @@ jobs:
             echo "Not yet eligible ($DAYS_AS_LATEST days < 5 days required)"
           fi
 
-      # ── Discover missing upstream releases (auto-check only) ──────────────
-      # Lists non-prerelease, non-draft release tags on the upstream repo,
-      # diffs them against GHCR, and emits a JSON array of versions missing
-      # from the registry. cron-jobs.org can then call auto-check daily and
-      # the workflow will auto-build any newly published upstream release
-      # without manual intervention.
+      # ── Discover missing upstream version tags (auto-check only) ──────────
+      # Lists semver tags on the upstream repo (via git ls-remote so tag-only
+      # versions like v1.10.0 — pushed without a corresponding GitHub Release
+      # — are not silently dropped by the Releases API), diffs them against
+      # GHCR, and emits a JSON array of versions missing from the registry.
+      # The strict semver regex excludes pre-release suffixes (-rc/-alpha/
+      # -beta/-pre/-dev), preserving the prior --exclude-pre-releases
+      # semantics. cron-jobs.org can then call auto-check daily and the
+      # workflow will auto-build any newly tagged upstream version without
+      # manual intervention.
       - name: Discover missing upstream releases
         id: discover-releases
         if: steps.set-action.outputs.action == 'auto-check'
@@ -624,17 +628,21 @@ jobs:
           export -f probe_version
           export FORCE_TAG GHCR_REPO="${{ env.GHCR_REPO }}"
 
-          # gh CLI has built-in retry + token auth from GH_TOKEN.
-          ALL_VERS=$(GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" gh release list \
-            --repo FreePeak/db-mcp-server \
-            --limit 100 \
-            --exclude-drafts --exclude-pre-releases \
-            --json tagName \
-            --jq '.[].tagName' 2>/dev/null \
-            | sed 's/^v//' | sort -V || echo "")
+          # Discover upstream version tags via git ls-remote rather than the
+          # Releases API. Some upstream tags (e.g. v1.10.0) are pushed without
+          # a corresponding GitHub Release publish; the Releases API would
+          # silently skip them. --refs hides the peeled-tag (^{}) duplicates
+          # that ls-remote emits for annotated tags. The strict semver regex
+          # excludes pre-release suffixes to match the prior
+          # --exclude-pre-releases behaviour.
+          ALL_VERS=$(git ls-remote --tags --refs https://github.com/FreePeak/db-mcp-server.git 2>/dev/null \
+            | awk -F'refs/tags/' '{print $2}' \
+            | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sed 's/^v//' \
+            | sort -uV || echo "")
 
           if [[ -z "$ALL_VERS" ]]; then
-            echo "::warning::Upstream release list fetch failed — skipping release discovery"
+            echo "::warning::Upstream tag list fetch failed — skipping release discovery"
             echo "missing_releases_json=[]" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1398,6 +1406,16 @@ jobs:
           mkdir -p ./resources
           cp ../resources/entrypoint.sh ../resources/banner.sh ../resources/haproxy.cfg.template ./resources/
           echo "✅ Injected overlay files into upstream build context"
+
+          # Vendor fallback config.json for upstream tags that ship without one
+          # (1.0.x–1.3.x). Keeps the runtime-stage `COPY config.json` step
+          # working across every release tag without per-version Dockerfile
+          # branching. Mirrors the v1.10.0 multi-DB connection sample so the
+          # image still boots with sane defaults.
+          if [ ! -f config.json ]; then
+            cp ../fallback-config.json config.json
+            echo "📦 Vendored fallback config.json (upstream $CHECKOUT_REF lacks one)"
+          fi
 
           echo "upstream_sha=$RESOLVED_SHA" >> "$GITHUB_OUTPUT"
           echo "upstream_ref=$CHECKOUT_REF" >> "$GITHUB_OUTPUT"
