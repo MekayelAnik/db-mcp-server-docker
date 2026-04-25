@@ -1,0 +1,23 @@
+{
+  "connections": [
+    {
+      "id": "smoke_db",
+      "type": "postgres",
+      "host": "localhost",
+      "port": 5432,
+      "name": "smoke_db",
+      "user": "dbmcp",
+      "password": "smokepass",
+      "query_timeout": 30,
+      "max_open_conns": 5,
+      "max_idle_conns": 2,
+      "conn_max_lifetime_seconds": 300,
+      "conn_max_idle_time_seconds": 60,
+      "features": {
+        "extensions": [
+          "timescaledb"
+        ]
+      }
+    }
+  ]
+}

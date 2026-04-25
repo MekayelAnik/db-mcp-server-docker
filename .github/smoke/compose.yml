@@ -1,0 +1,25 @@
+# Local-repro shim for the post-build smoke battery.
+#
+# Boots the same Postgres+TimescaleDB used by CI, then run-smoke.sh against
+# any image you want to validate.
+#
+# Usage:
+#   docker compose -f .github/smoke/compose.yml up -d postgres
+#   bash .github/smoke/run-smoke.sh ghcr.io/<owner>/db-mcp-server:nightly
+#   docker compose -f .github/smoke/compose.yml down -v
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg18
+    container_name: dbmcp-smoke-postgres
+    environment:
+      POSTGRES_USER: dbmcp
+      POSTGRES_PASSWORD: smokepass
+      POSTGRES_DB: smoke_db
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "dbmcp", "-d", "smoke_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

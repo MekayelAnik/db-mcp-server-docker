@@ -2116,16 +2116,121 @@ jobs:
           if-no-files-found: ignore
 
   # ============================================================================
+  # Job 3.5 — Post-build MCP smoke test (per version)
+  # ----------------------------------------------------------------------------
+  # Boots a fresh PostgreSQL+TimescaleDB service container, pulls the just-
+  # published GHCR image for THIS matrix version, and runs the full MCP
+  # `tools/call` battery defined in .github/smoke/run-smoke.sh.
+  #
+  # Failure here STOPS sync-registries (and therefore the Docker Hub mirror)
+  # so a broken image cannot escape. amd64-only — same Go binary as arm64/v7
+  # cross-builds, so formatter/transport regressions surface here regardless
+  # of platform. Catches:
+  #   - Upstream FormatResponse double-wrap regressions (PR #67 guard)
+  #   - Broken supergateway link, HAProxy mis-routing, busted entrypoint
+  #   - MCP transport / handshake / tool-family drift
+  # ============================================================================
+  smoke-test:
+    name: Smoke Test ${{ matrix.version }}
+    runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
+    needs: [check-releases, merge-manifest]
+    if: ${{ !cancelled() && needs.merge-manifest.result == 'success' }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.check-releases.outputs.versions_json || '[]') }}
+
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_USER:     dbmcp
+          POSTGRES_PASSWORD: smokepass
+          POSTGRES_DB:       smoke_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dbmcp -d smoke_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client jq curl
+
+      - name: Login to GHCR (read-only)
+        uses: ./.github/actions/registry-login
+        with:
+          ghcr_actor:         ${{ github.actor }}
+          ghcr_token:         ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+          push_to_dockerhub:  'false'
+          push_to_ghcr:       'true'
+
+      - name: Run MCP smoke battery
+        env:
+          IMAGE_REF: ${{ env.GHCR_REPO }}:${{ matrix.version }}
+          PG_HOST:   localhost
+          PG_PORT:   '5432'
+          PG_USER:   dbmcp
+          PG_PASS:   smokepass
+          PG_DB:     smoke_db
+          MCP_PORT:  '39092'
+        run: |
+          chmod +x .github/smoke/run-smoke.sh
+          bash .github/smoke/run-smoke.sh "$IMAGE_REF"
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          {
+            echo "## ❌ Smoke failed: ${{ matrix.version }}"
+            echo
+            echo "### Container logs"
+            echo '```'
+            docker logs dbmcp-smoke 2>&1 | tail -200 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary on success
+        if: success()
+        run: |
+          {
+            echo "## ✅ Smoke passed: ${{ matrix.version }}"
+            echo
+            echo "Image: \`${{ env.GHCR_REPO }}:${{ matrix.version }}\`"
+            echo "Postgres: \`timescale/timescaledb-ha:pg18\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================================
   # Job 4 — Registry sync (bidirectional DH ↔ GHCR via skopeo)
+  # ----------------------------------------------------------------------------
+  # Gated on smoke-test passing for every version. The sync-registries
+  # dispatch path (action_type == 'sync-registries') bypasses smoke because
+  # it mirrors pre-existing GHCR images that were already smoked at build
+  # time.
   # ============================================================================
   sync-registries:
     name: Sync Registries
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
-    needs: [check-releases, merge-manifest]
+    needs: [check-releases, merge-manifest, smoke-test]
     if: |
       always() &&
       (needs.check-releases.outputs.action_type == 'sync-registries' ||
-       needs.merge-manifest.result == 'success')
+       (needs.merge-manifest.result == 'success' &&
+        needs.smoke-test.result == 'success'))
 
     permissions:
       contents: read
