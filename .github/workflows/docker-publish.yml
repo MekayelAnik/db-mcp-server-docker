@@ -31,6 +31,19 @@
 name: Docker Build & Publish
 
 on:
+  # ── External dispatch (cron-job.org / scheduler) ────────────────────────────
+  # Mirrors the workflow_dispatch inputs as client_payload fields so a
+  # fine-grained PAT with only Contents: read/write can fire the workflow
+  # via POST /repos/{o}/{r}/dispatches (workflow_dispatch needs Actions:
+  # write). Trigger types are namespaced so different schedulers can target
+  # specific actions without colliding.
+  repository_dispatch:
+    types:
+      - auto-check
+      - build-versions
+      - promote-image
+      - sync-registries
+      - mark-stable
   # ── Manual dispatch ─────────────────────────────────────────────────────────
   workflow_dispatch:
     inputs:
@@ -196,10 +209,35 @@ permissions:
 # Per-matrix-entry concurrency is still scoped by (version, platform_slug) in
 # the build-platform job, so distinct versions within one run parallelize.
 concurrency:
-  group: docker-build-${{ github.event.inputs.action || 'auto-check' }}
+  group: docker-build-${{ github.event.inputs.action || github.event.client_payload.action || github.event.action || 'auto-check' }}
   cancel-in-progress: false
 
 env:
+  # ── Input normalization (workflow_dispatch + repository_dispatch) ──────────
+  # repository_dispatch carries fields under github.event.client_payload.*
+  # while workflow_dispatch uses github.event.inputs.* — fall through both
+  # so downstream steps can read a single env.IN_* name regardless of how
+  # the run was triggered. Defaults mirror the workflow_dispatch input
+  # defaults exactly.
+  IN_ACTION:               ${{ github.event.inputs.action               || github.event.client_payload.action               || github.event.action || 'auto-check' }}
+  IN_BUILD_PROFILE:        ${{ github.event.inputs.build_profile        || github.event.client_payload.build_profile        || 'production' }}
+  IN_VERSIONS:             ${{ github.event.inputs.versions             || github.event.client_payload.versions             || '' }}
+  IN_PROMOTE_VERSION:      ${{ github.event.inputs.promote_version      || github.event.client_payload.promote_version      || '' }}
+  IN_PROMOTE_TAG:          ${{ github.event.inputs.promote_tag          || github.event.client_payload.promote_tag          || 'latest' }}
+  IN_FORCE_BUILD:          ${{ github.event.inputs.force_build          || github.event.client_payload.force_build          || 'false' }}
+  IN_FORCE_NIGHTLY:        ${{ github.event.inputs.force_nightly        || github.event.client_payload.force_nightly        || 'false' }}
+  IN_FORCE_RELEASE_TAG:    ${{ github.event.inputs.force_release_tag    || github.event.client_payload.force_release_tag    || '' }}
+  IN_NIGHTLY_SHA_OVERRIDE: ${{ github.event.inputs.nightly_sha_override || github.event.client_payload.nightly_sha_override || '' }}
+  IN_SKIP_EXISTING:        ${{ github.event.inputs.skip_existing        || github.event.client_payload.skip_existing        || 'true' }}
+  IN_RUN_SECURITY_SCAN:    ${{ github.event.inputs.run_security_scan    || github.event.client_payload.run_security_scan    || 'true' }}
+  IN_PUSH_TO_DOCKERHUB:    ${{ github.event.inputs.push_to_dockerhub    || github.event.client_payload.push_to_dockerhub    || 'true' }}
+  IN_PUSH_TO_GHCR:         ${{ github.event.inputs.push_to_ghcr         || github.event.client_payload.push_to_ghcr         || 'true' }}
+  IN_UPDATE_BASE_IMAGE:    ${{ github.event.inputs.update_base_image    || github.event.client_payload.update_base_image    || 'false' }}
+  IN_PLATFORMS:            ${{ github.event.inputs.platforms            || github.event.client_payload.platforms            || 'linux/amd64,linux/arm64,linux/arm/v7' }}
+  IN_COMPRESSION_LEVEL:    ${{ github.event.inputs.compression_level    || github.event.client_payload.compression_level    || '22' }}
+  IN_CUSTOM_TAG:           ${{ github.event.inputs.custom_tag           || github.event.client_payload.custom_tag           || '' }}
+  IN_TAG_AS_LATEST:        ${{ github.event.inputs.tag_as_latest        || github.event.client_payload.tag_as_latest        || 'true' }}
+
   TZ:               ${{ vars.TZ               || 'Asia/Dhaka' }}
   DOCKERHUB_REPO:   ${{ vars.DOCKERHUB_REPO   || 'your-dockerhub-user/db-mcp-server' }}
   GHCR_REPO:        ${{ vars.GHCR_REPO        || 'ghcr.io/your-github-user/db-mcp-server' }}
@@ -261,8 +299,8 @@ jobs:
         id: profile
         run: |
           # workflow_dispatch may supply both profile and compression_level overrides
-          PROFILE="${{ github.event.inputs.build_profile || 'production' }}"
-          LEVEL_OVERRIDE="${{ github.event.inputs.compression_level }}"
+          PROFILE="${{ env.IN_BUILD_PROFILE || 'production' }}"
+          LEVEL_OVERRIDE="${{ env.IN_COMPRESSION_LEVEL }}"
 
           case "$PROFILE" in
             development|dev)
@@ -359,12 +397,12 @@ jobs:
           # Default to auto-check for non-dispatch triggers (e.g. cron-jobs.org
           # POST with no inputs.action). Without the default, every downstream
           # `if: steps.set-action.outputs.action == 'auto-check'` silently no-ops.
-          echo "action=${{ github.event.inputs.action || 'auto-check' }}" >> "$GITHUB_OUTPUT"
+          echo "action=${{ env.IN_ACTION || 'auto-check' }}" >> "$GITHUB_OUTPUT"
 
       - name: Set platforms
         id: set-platforms
         run: |
-          P="${{ github.event.inputs.platforms }}"
+          P="${{ env.IN_PLATFORMS }}"
           echo "platforms=${P:-${{ env.DEFAULT_PLATFORMS }}}" >> "$GITHUB_OUTPUT"
 
       - name: Validate compression config
@@ -470,7 +508,7 @@ jobs:
       - name: Check base image for updates
         id: check-base-image
         run: |
-          UPDATE_ENABLED="${{ github.event.inputs.update_base_image || env.UPDATE_BASE_IMAGE_ENABLED }}"
+          UPDATE_ENABLED="${{ env.IN_UPDATE_BASE_IMAGE || env.UPDATE_BASE_IMAGE_ENABLED }}"
           if [[ "$UPDATE_ENABLED" != "true" ]]; then
             echo "updated=false" >> "$GITHUB_OUTPUT"
             echo "Base image update check disabled"
@@ -586,7 +624,7 @@ jobs:
         id: discover-releases
         if: steps.set-action.outputs.action == 'auto-check'
         env:
-          FORCE_TAG: ${{ github.event.inputs.force_release_tag }}
+          FORCE_TAG: ${{ env.IN_FORCE_RELEASE_TAG }}
         run: |
           # Retry-tolerant skopeo inspect. Distinguishes "image not present"
           # (404 / manifest unknown — definitive, no retry) from transient
@@ -707,9 +745,9 @@ jobs:
         if: steps.set-action.outputs.action == 'auto-check'
         env:
           SKIP_NIGHTLY_SHAS: ${{ vars.SKIP_NIGHTLY_SHAS }}
-          FORCE_NIGHTLY: ${{ github.event.inputs.force_nightly }}
-          FORCE_BUILD:   ${{ github.event.inputs.force_build }}
-          SHA_OVERRIDE:  ${{ github.event.inputs.nightly_sha_override }}
+          FORCE_NIGHTLY: ${{ env.IN_FORCE_NIGHTLY }}
+          FORCE_BUILD:   ${{ env.IN_FORCE_BUILD }}
+          SHA_OVERRIDE:  ${{ env.IN_NIGHTLY_SHA_OVERRIDE }}
         run: |
           # Emit empty-output skip helper. Call as:  skip "reason"
           skip() {
@@ -964,10 +1002,10 @@ jobs:
         id: determine-versions
         run: |
           ACTION="${{ steps.set-action.outputs.action }}"
-          FORCE="${{ github.event.inputs.force_build }}"
-          SKIP_EXISTING="${{ github.event.inputs.skip_existing || 'true' }}"
+          FORCE="${{ env.IN_FORCE_BUILD }}"
+          SKIP_EXISTING="${{ env.IN_SKIP_EXISTING || 'true' }}"
           BASE_UPDATED="${{ steps.check-base-image.outputs.updated }}"
-          UPDATE_ENABLED="${{ github.event.inputs.update_base_image || env.UPDATE_BASE_IMAGE_ENABLED }}"
+          UPDATE_ENABLED="${{ env.IN_UPDATE_BASE_IMAGE || env.UPDATE_BASE_IMAGE_ENABLED }}"
 
           # For git-tag pushes, version = tag name (strip leading 'v')
           GIT_TAG_VERSION=""
@@ -1062,7 +1100,7 @@ jobs:
               ;;
 
             build-versions)
-              INPUT="${{ github.event.inputs.versions }}"
+              INPUT="${{ env.IN_VERSIONS }}"
               if [[ -z "$INPUT" ]]; then
                 if [[ "$FORCE" == "true" ]]; then
                   # Force build without explicit versions: resolve current version from GHCR
@@ -1344,10 +1382,10 @@ jobs:
             echo "| Base Image Updated | ${{ steps.check-base-image.outputs.updated }} |"
             echo "| Platforms | ${{ steps.set-platforms.outputs.platforms }} |"
             echo "| Compression | ${{ needs.resolve-profile.outputs.compression_type }} level ${{ needs.resolve-profile.outputs.compression_level }} |"
-            echo "| Build Profile | ${{ github.event.inputs.build_profile || 'production' }} |"
-            echo "| Custom Tag | ${{ github.event.inputs.custom_tag || '(auto-generated)' }} |"
-            echo "| Compression Level | ${{ github.event.inputs.compression_level || '22' }} |"
-            echo "| Tag as Latest | ${{ github.event.inputs.tag_as_latest || 'true' }} |"
+            echo "| Build Profile | ${{ env.IN_BUILD_PROFILE || 'production' }} |"
+            echo "| Custom Tag | ${{ env.IN_CUSTOM_TAG || '(auto-generated)' }} |"
+            echo "| Compression Level | ${{ env.IN_COMPRESSION_LEVEL || '22' }} |"
+            echo "| Tag as Latest | ${{ env.IN_TAG_AS_LATEST || 'true' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ============================================================================
@@ -1492,7 +1530,7 @@ jobs:
         env:
           TZ_VAL: ${{ env.TZ }}
           RESOLVED_SHA: ${{ steps.upstream.outputs.upstream_sha }}
-          CUSTOM: ${{ github.event.inputs.custom_tag }}
+          CUSTOM: ${{ env.IN_CUSTOM_TAG }}
           VERSION: ${{ matrix.version }}
         run: |
           DATE=$(TZ="$TZ_VAL" date +"%Y%m%d")
@@ -1540,7 +1578,7 @@ jobs:
             # Floating date-only tag: YYYYMMDD
             type=raw,value=${{ steps.build-tag.outputs.date }}
             # Floating :latest — controlled by tag_as_latest checkbox
-            type=raw,value=latest,enable=${{ github.event.inputs.tag_as_latest != 'false' && github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ env.IN_TAG_AS_LATEST != 'false' && github.ref == 'refs/heads/main' }}
           labels: |
             org.opencontainers.image.title=db-mcp-server
             org.opencontainers.image.description=Multi-database MCP server for AI assistants
@@ -1574,7 +1612,7 @@ jobs:
         run: |
           echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
           echo "Build started at $(date -u)"
-          echo "Profile:     ${{ github.event.inputs.build_profile || 'production' }}"
+          echo "Profile:     ${{ env.IN_BUILD_PROFILE || 'production' }}"
           echo "Compression: ${{ needs.check-releases.outputs.compression_params }}"
           echo "Platform:    ${{ matrix.platform }}"
           echo "Version:     ${{ matrix.version }}"
@@ -1680,7 +1718,7 @@ jobs:
           outputs: >-
             ${{
               format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true,{1},export-cache-concurrency={2},export-layers-concurrency={3}',
-                    (github.event.inputs.push_to_ghcr != 'false' && env.GHCR_REPO || env.DOCKERHUB_REPO),
+                    (env.IN_PUSH_TO_GHCR != 'false' && env.GHCR_REPO || env.DOCKERHUB_REPO),
                     needs.check-releases.outputs.compression_params,
                     env.EXPORT_CACHE_CONCURRENCY,
                     env.EXPORT_LAYERS_CONCURRENCY)
@@ -1811,8 +1849,8 @@ jobs:
         env:
           TZ_VAL: ${{ env.TZ }}
           VERSION: ${{ matrix.version }}
-          CUSTOM: ${{ github.event.inputs.custom_tag }}
-          TAG_AS_LATEST: ${{ github.event.inputs.tag_as_latest || 'true' }}
+          CUSTOM: ${{ env.IN_CUSTOM_TAG }}
+          TAG_AS_LATEST: ${{ env.IN_TAG_AS_LATEST || 'true' }}
           VERSIONS_JSON: ${{ needs.check-releases.outputs.versions_json }}
           NIGHTLY_SHA_IN: ${{ needs.check-releases.outputs.nightly_sha }}
           NIGHTLY_SHORT_IN: ${{ needs.check-releases.outputs.nightly_short_sha }}
@@ -1944,10 +1982,10 @@ jobs:
       # ── Docker Hub manifest (with retry — mirrors merge job in docker-build.yml) ──
       - name: Create Docker Hub multi-arch manifest
         id: dockerhub-manifest
-        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.push_to_dockerhub != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && env.IN_PUSH_TO_DOCKERHUB != 'false'
         run: |
           SOURCE_REPO="${{ env.GHCR_REPO }}"
-          if [[ "${{ github.event.inputs.push_to_ghcr || 'true' }}" != "true" ]]; then
+          if [[ "${{ env.IN_PUSH_TO_GHCR || 'true' }}" != "true" ]]; then
             SOURCE_REPO="${{ env.DOCKERHUB_REPO }}"
           fi
           SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${SOURCE_REPO}@sha256:$(basename $f)"; done | tr '\n' ' ')
@@ -1987,7 +2025,7 @@ jobs:
 
       # ── GHCR manifest (with retry) ─────────────────────────────────────────
       - name: Create GHCR multi-arch manifest
-        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.push_to_ghcr != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && env.IN_PUSH_TO_GHCR != 'false'
         run: |
           SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
           for attempt in 1 2 3; do
@@ -2021,7 +2059,7 @@ jobs:
       # ── Trivy security scan (non-blocking) ────────────────────────────────
       - name: Trivy vulnerability scan
         id: trivy-scan
-        if: steps.check-digests.outputs.has_digests == 'true' && github.event.inputs.run_security_scan != 'false'
+        if: steps.check-digests.outputs.has_digests == 'true' && env.IN_RUN_SECURITY_SCAN != 'false'
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: '${{ env.GHCR_REPO }}:${{ steps.tags.outputs.primary_tag }}'
@@ -2035,7 +2073,7 @@ jobs:
         # Only upload if scan actually produced a file — skips when Trivy install fails
         if: >
           steps.check-digests.outputs.has_digests == 'true' &&
-          github.event.inputs.run_security_scan != 'false' &&
+          env.IN_RUN_SECURITY_SCAN != 'false' &&
           steps.trivy-scan.outcome == 'success' &&
           hashFiles(format('trivy-{0}.sarif', matrix.version)) != ''
         uses: github/codeql-action/upload-sarif@v4
@@ -2133,7 +2171,7 @@ jobs:
     steps:
       - name: Validate inputs
         run: |
-          [[ -z "${{ github.event.inputs.promote_version }}" ]] \
+          [[ -z "${{ env.IN_PROMOTE_VERSION }}" ]] \
             && { echo "::error::promote_version is required"; exit 1; }
 
       - name: Checkout
@@ -2154,8 +2192,8 @@ jobs:
 
       - name: Promote image
         run: |
-          SRC="${{ github.event.inputs.promote_version }}"
-          TGT="${{ github.event.inputs.promote_tag }}"
+          SRC="${{ env.IN_PROMOTE_VERSION }}"
+          TGT="${{ env.IN_PROMOTE_TAG }}"
 
           # Rate-limit tolerant skopeo copy
           skopeo_copy_rl() {
