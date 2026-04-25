@@ -6,6 +6,7 @@
   ],
   "enabledManagers": [
     "github-actions",
+    "docker-compose",
     "custom.regex"
   ],
   "pinDigests": false,
@@ -23,6 +24,19 @@
       "matchStrings": ["CRANE_FALLBACK_VERSIONS=\\(\"(?<currentValue>v[\\d.]+)\""],
       "depNameTemplate": "google/go-containerregistry",
       "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
+      "description": "Track timescale/timescaledb-ha pg<N> major in smoke service container (pg18 → pg19 → ...)",
+      "managerFilePatterns": [
+        "/(^|/)\\.github/workflows/smoke-test\\.ya?ml$/",
+        "/(^|/)\\.github/smoke/compose\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "image:\\s+(?<depName>timescale/timescaledb-ha):(?<currentValue>pg\\d+)"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "regex:^pg(?<major>\\d+)$"
     }
   ],
   "labels": [
@@ -93,6 +107,22 @@
         "github-actions"
       ],
       "groupName": "github-actions-major"
+    },
+    {
+      "description": "TimescaleDB-HA pg<N> bump: PR only, no auto-merge — DB major bumps deserve human review (extension API, query planner changes, etc.)",
+      "matchPackageNames": [
+        "timescale/timescaledb-ha"
+      ],
+      "automerge": false,
+      "labels": [
+        "dependencies",
+        "smoke-test",
+        "database"
+      ],
+      "commitMessageTopic": "TimescaleDB ({{depName}})",
+      "prBodyNotes": [
+        "**Smoke test impact:** This bumps the PostgreSQL+TimescaleDB version used by `.github/workflows/smoke-test.yml` and `.github/smoke/compose.yml`. Verify the smoke battery still passes against the new pg<N> image before merging — TimescaleDB sometimes drops/renames functions across major Postgres versions."
+      ]
     }
   ],
   "commitMessagePrefix": "ci: ",
