@@ -1,0 +1,136 @@
+# .github/workflows/smoke-test.yml
+# =============================================================================
+# Reusable post-build MCP smoke test.
+#
+# Boots a fresh PostgreSQL+TimescaleDB service container, pulls the
+# specified image, and runs the full MCP `tools/call` battery defined in
+# .github/smoke/run-smoke.sh.
+#
+# Modes
+# ─────────────────────────────────────────────────────────────────────────────
+#   workflow_call → invoked by docker-publish.yml after merge-manifest
+#                   succeeds for a given version. Caller passes image_ref +
+#                   version. Smoke result gates sync-registries (strict for
+#                   nightly, advisory for release tags — see caller's `if`).
+#
+#   workflow_dispatch → manual re-smoke of an existing GHCR image without
+#                       forcing a rebuild. Useful for ad-hoc validation
+#                       after upstream fixes land.
+# =============================================================================
+
+name: Smoke Test (MCP)
+
+on:
+  workflow_call:
+    inputs:
+      image_ref:
+        description: 'Full image ref to smoke (e.g. ghcr.io/owner/db-mcp-server:nightly)'
+        required: true
+        type: string
+      version:
+        description: 'Version label for summary (informational)'
+        required: false
+        type: string
+        default: ''
+      runner_version:
+        description: 'GitHub Actions runner image (default: ubuntu-latest)'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      ghcr_token:
+        description: 'GHCR read token (GITHUB_TOKEN with packages:read or GHCR_TOKEN)'
+        required: true
+
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: 'Full image ref to smoke'
+        required: true
+        type: string
+        default: 'ghcr.io/mekayelanik/db-mcp-server:nightly'
+      version:
+        description: 'Version label for summary'
+        required: false
+        type: string
+        default: 'manual'
+
+jobs:
+  smoke:
+    name: Smoke Test ${{ inputs.version || inputs.image_ref }}
+    runs-on: ${{ inputs.runner_version || 'ubuntu-latest' }}
+
+    permissions:
+      contents: read
+      packages: read
+
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg18
+        env:
+          POSTGRES_USER:     dbmcp
+          POSTGRES_PASSWORD: smokepass
+          POSTGRES_DB:       smoke_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dbmcp -d smoke_db"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install client tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client jq curl
+
+      - name: Login to GHCR (read-only)
+        uses: ./.github/actions/registry-login
+        with:
+          ghcr_actor:        ${{ github.actor }}
+          ghcr_token:        ${{ secrets.ghcr_token != '' && secrets.ghcr_token || secrets.GITHUB_TOKEN }}
+          push_to_dockerhub: 'false'
+          push_to_ghcr:      'true'
+
+      - name: Run MCP smoke battery
+        env:
+          IMAGE_REF: ${{ inputs.image_ref }}
+          PG_HOST:   localhost
+          PG_PORT:   '5432'
+          PG_USER:   dbmcp
+          PG_PASS:   smokepass
+          PG_DB:     smoke_db
+          MCP_PORT:  '39092'
+        run: |
+          chmod +x .github/smoke/run-smoke.sh
+          bash .github/smoke/run-smoke.sh "$IMAGE_REF"
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          {
+            echo "## ❌ Smoke failed: ${{ inputs.version || inputs.image_ref }}"
+            echo
+            echo "Image: \`${{ inputs.image_ref }}\`"
+            echo
+            echo "### Container logs (tail 200)"
+            echo '```'
+            docker logs dbmcp-smoke 2>&1 | tail -200 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summary on success
+        if: success()
+        run: |
+          {
+            echo "## ✅ Smoke passed: ${{ inputs.version || inputs.image_ref }}"
+            echo
+            echo "Image: \`${{ inputs.image_ref }}\`"
+            echo "Postgres: \`timescale/timescaledb-ha:pg18\`"
+          } >> "$GITHUB_STEP_SUMMARY"
