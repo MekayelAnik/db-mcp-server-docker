@@ -647,6 +647,26 @@ jobs:
             exit 0
           fi
 
+          # Drop EXCLUDE_VERSIONS up-front so the GHCR probe loop never
+          # runs against versions we have no intention of building. Avoids
+          # the "➕ X not in GHCR — will build" log line for excluded
+          # tags (fixed downstream by filter-excluded, but the wording
+          # was misleading) and shaves off N skopeo probes.
+          if [[ -n "${EXCLUDE_VERSIONS:-}" ]]; then
+            EXCLUDE_LIST=$(echo "$EXCLUDE_VERSIONS" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d')
+            if [[ -n "$EXCLUDE_LIST" ]]; then
+              SKIPPED=$(comm -12 <(echo "$ALL_VERS" | sort) <(echo "$EXCLUDE_LIST" | sort) | tr '\n' ' ')
+              ALL_VERS=$(comm -23 <(echo "$ALL_VERS" | sort) <(echo "$EXCLUDE_LIST" | sort) | sort -V)
+              [[ -n "$SKIPPED" ]] && echo "  🚫 Excluded by EXCLUDE_VERSIONS: ${SKIPPED% }"
+            fi
+          fi
+
+          if [[ -z "$ALL_VERS" ]]; then
+            echo "✅ All upstream tags excluded — nothing to probe"
+            echo "missing_releases_json=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Parallel probe: -P 20 caps concurrency to match matrix max-parallel.
           # FORCE_TAG comes through env: to avoid shell injection if a user
           # pastes metachars into the workflow_dispatch input field.
