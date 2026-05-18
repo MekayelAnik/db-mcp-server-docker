@@ -993,3 +993,17 @@ Built on top of [FreePeak/db-mcp-server](https://github.com/FreePeak/db-mcp-serv
     <img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="217" height="60">
   </a>
 </p>
+
+
+---
+
+### mcp-proxy: Memory & Concurrency Tuning
+
+This image now uses **mcp-proxy** (sparfenyuk/mcp-proxy) instead of supergateway as the stdio<->HTTP bridge:
+
+- `MCP_PROXY_STATELESS=false` (default): one stdio backend child shared across **all** MCP sessions, JSON-RPC-id-multiplexed. Minimal memory, no per-request fork cost. Legacy `STATEFUL` is mapped to this on a per-precedence basis (MCP_PROXY_STATELESS wins).
+- `MCP_PROXY_STATELESS=true`: per-request transport instance.
+- `HAPROXY_FRONTEND_MAXCONN=64` / `HAPROXY_SERVER_MAXCONN=16`: HAProxy-level caps. 0 disables.
+- WebSocket transport is no longer supported (mcp-proxy upstream does not implement it).
+
+Root cause: supergateway 3.4.3 stateless mode (default) spawned a child stdio process per POST and never reaped it (supercorp-ai/supergateway#108).

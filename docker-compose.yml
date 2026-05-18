@@ -1,0 +1,33 @@
+services:
+  db-mcp-server:
+    image: mekayelanik/db-mcp-server:latest
+    container_name: db-mcp-server
+    environment:
+      - SERVER_PORT=9092
+      - INTERNAL_SERVER_PORT=38011
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - PROTOCOL=SHTTP
+      - ENABLE_HTTPS=true
+      - HTTP_VERSION_MODE=auto
+      - CONFIG_PATH=/app/config.json
+      # mcp-proxy session model. Stateful by default - one stdio child shared
+      # across all sessions, multiplexed by JSON-RPC ids.
+      - MCP_PROXY_STATELESS=false
+      # Cap virtual memory of the backend stdio child (MiB; 0 disables).
+      - DB_MCP_MAX_MEM_MB=4096
+      # HAProxy concurrency caps (0 disables)
+      - HAPROXY_FRONTEND_MAXCONN=64
+      - HAPROXY_SERVER_MAXCONN=16
+      # Optional: require Bearer token auth at HAProxy layer
+      # - API_KEY=replace-with-strong-secret
+      # Optional: CORS origins (comma-separated, or * for all)
+      # - CORS=*
+    ports:
+      - "9092:9092"
+      - "9092:9092/udp"
+    volumes:
+      - ./logs:/app/logs
+      - ./config.json:/app/config.json:ro
+    restart: unless-stopped
