@@ -1707,6 +1707,16 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ steps.upstream.outputs.upstream_sha }}
             BASE_IMAGE_DIGEST=${{ steps.base-digest.outputs.digest }}
+          annotations: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=DB MCP Server Docker
+            org.opencontainers.image.licenses=GPL-3.0
+            org.opencontainers.image.title=db-mcp-server-docker
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.authors=MD. MEKAYEL ANIK <mekayel.anik@gmail.com>
+            org.opencontainers.image.vendor=MD. MEKAYEL ANIK
+            dev.mekayelanik.country-of-origin=Bangladesh
+            dev.mekayelanik.message=== Free Palestine ==
           # GHA cache primary + GHCR registry cache fallback (zstd compression)
           cache-from: |
             type=gha,scope=build-${{ matrix.version }}-${{ matrix.platform_slug }}
@@ -1992,9 +2002,19 @@ jobs:
           SUCCESS=0
           RATE_LIMITED=0
 
+          ANNO_ARGS=()
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.description=DB MCP Server Docker")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.licenses=GPL-3.0")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.title=db-mcp-server-docker")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.url=https://github.com/${{ github.repository }}")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.authors=MD. MEKAYEL ANIK <mekayel.anik@gmail.com>")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.vendor=MD. MEKAYEL ANIK")
+          ANNO_ARGS+=(--annotation "index:dev.mekayelanik.country-of-origin=Bangladesh")
+          ANNO_ARGS+=(--annotation "index:dev.mekayelanik.message=== Free Palestine ==")
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
-            OUTPUT=$(docker buildx imagetools create ${{ steps.tags.outputs.dockerhub_tags }} $SOURCES 2>&1) && {
+            OUTPUT=$(docker buildx imagetools create "${ANNO_ARGS[@]}" ${{ steps.tags.outputs.dockerhub_tags }} $SOURCES 2>&1) && {
               echo "$OUTPUT"
               SUCCESS=1
               break
@@ -2028,9 +2048,20 @@ jobs:
         if: steps.check-digests.outputs.has_digests == 'true' && env.IN_PUSH_TO_GHCR != 'false'
         run: |
           SOURCES=$(for f in /tmp/digests/*; do [[ -f "$f" ]] || continue; echo "${{ env.GHCR_REPO }}@sha256:$(basename $f)"; done | tr '\n' ' ')
+
+          ANNO_ARGS=()
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.description=DB MCP Server Docker")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.licenses=GPL-3.0")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.title=db-mcp-server-docker")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.url=https://github.com/${{ github.repository }}")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.authors=MD. MEKAYEL ANIK <mekayel.anik@gmail.com>")
+          ANNO_ARGS+=(--annotation "index:org.opencontainers.image.vendor=MD. MEKAYEL ANIK")
+          ANNO_ARGS+=(--annotation "index:dev.mekayelanik.country-of-origin=Bangladesh")
+          ANNO_ARGS+=(--annotation "index:dev.mekayelanik.message=== Free Palestine ==")
           for attempt in 1 2 3; do
             echo "Attempt $attempt/3..."
-            OUTPUT=$(docker buildx imagetools create ${{ steps.tags.outputs.ghcr_tags }} $SOURCES 2>&1) && { echo "$OUTPUT"; break; }
+            OUTPUT=$(docker buildx imagetools create "${ANNO_ARGS[@]}" ${{ steps.tags.outputs.ghcr_tags }} $SOURCES 2>&1) && { echo "$OUTPUT"; break; }
             echo "$OUTPUT"
             # GHCR has higher rate limits but can still 429 under heavy matrix
             # load; use longer backoff when the server tells us to slow down.
