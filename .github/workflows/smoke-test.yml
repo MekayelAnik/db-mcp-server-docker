@@ -57,6 +57,7 @@ on:
 
 jobs:
   smoke:
+    timeout-minutes: 120
     name: Smoke Test ${{ inputs.version || inputs.image_ref }}
     runs-on: ${{ inputs.runner_version || 'ubuntu-latest' }}
 

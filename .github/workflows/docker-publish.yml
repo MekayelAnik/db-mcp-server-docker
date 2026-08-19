@@ -283,6 +283,7 @@ jobs:
   # state SHA comparison was unsafe for nightly path.)
   # ============================================================================
   resolve-profile:
+    timeout-minutes: 120
     name: Resolve build profile
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     outputs:
@@ -346,6 +347,7 @@ jobs:
   # Mirrors check_dependencies() + validate_build_environment() + check-existing
   # ============================================================================
   check-releases:
+    timeout-minutes: 15
     name: Check Releases & Validate
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: resolve-profile
@@ -388,8 +390,16 @@ jobs:
 
       - name: Install tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y curl jq skopeo
+          # jq and curl ship with the runner image; only skopeo needs apt, and it is
+          # merely a fallback for crane -- a stalled mirror here must not hold the
+          # concurrency group. A hung apt once blocked this job for hours.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          if ! sudo timeout 120 apt-get update -qq; then
+            echo "::warning::apt-get update failed -- continuing with crane only"
+            exit 0
+          fi
+          sudo timeout 180 apt-get install -y -qq skopeo \
+            || echo "::warning::skopeo unavailable -- crane only"
 
       - name: Set action type
         id: set-action
@@ -1395,6 +1405,7 @@ jobs:
   build-platform:
     name: Build ${{ matrix.version }} (${{ matrix.platform_slug }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     needs: check-releases
     if: needs.check-releases.outputs.should_build == 'true' && needs.check-releases.outputs.build_matrix != '[]' && needs.check-releases.outputs.build_matrix != ''
 
@@ -1785,6 +1796,7 @@ jobs:
   # Job 3 — Merge per-platform digests into multi-arch manifests, per version
   # ============================================================================
   merge-manifest:
+    timeout-minutes: 120
     name: Merge Manifest ${{ matrix.version }}
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     # Per-version gate: proceed whenever check-releases succeeded and at least
@@ -2203,6 +2215,7 @@ jobs:
   # retracted via the DH UI if needed.
   # ============================================================================
   sync-registries:
+    timeout-minutes: 120
     name: Sync Registries
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: [check-releases, merge-manifest, smoke-test]
@@ -2224,7 +2237,10 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
-        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+        run: |
+          # skopeo is a crane fallback -- never let a stalled apt mirror hang the job.
+          sudo timeout 120 apt-get update -qq || { echo '::warning::apt-get update failed'; exit 0; }
+          sudo timeout 180 apt-get install -y -qq skopeo || echo '::warning::skopeo unavailable -- crane only'
 
       - name: Login to registries
         uses: ./.github/actions/registry-login
@@ -2245,6 +2261,7 @@ jobs:
   # Job 5 — Image promotion (version → latest/stable)
   # ============================================================================
   promote-image:
+    timeout-minutes: 120
     name: Promote Image
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: check-releases
@@ -2266,7 +2283,10 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
-        run: sudo apt-get update -qq && sudo apt-get install -y skopeo
+        run: |
+          # skopeo is a crane fallback -- never let a stalled apt mirror hang the job.
+          sudo timeout 120 apt-get update -qq || { echo '::warning::apt-get update failed'; exit 0; }
+          sudo timeout 180 apt-get install -y -qq skopeo || echo '::warning::skopeo unavailable -- crane only'
 
       - name: Login to registries
         uses: ./.github/actions/registry-login
@@ -2320,6 +2340,7 @@ jobs:
   mark-stable:
     name: Mark Stable
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
+    timeout-minutes: 120
     needs: [check-releases, merge-manifest, sync-registries]
     # Promote only when upstream jobs didn't fail. For manual mark-stable, merge
     # and sync may be skipped (no-build path) — treat `skipped` as acceptable.
@@ -2344,7 +2365,10 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install skopeo
-        run: sudo apt-get update -qq && sudo apt-get install -y skopeo jq
+        run: |
+          # skopeo is a crane fallback -- never let a stalled apt mirror hang the job.
+          sudo timeout 120 apt-get update -qq || { echo '::warning::apt-get update failed'; exit 0; }
+          sudo timeout 180 apt-get install -y -qq skopeo || echo '::warning::skopeo unavailable -- crane only'
 
       - name: Login to registries
         uses: ./.github/actions/registry-login
@@ -2466,6 +2490,7 @@ jobs:
   # Job 7 — Cache housekeeping (mirrors optimize-cache / clean-cache)
   # ============================================================================
   cache-cleanup:
+    timeout-minutes: 15
     name: Cache Housekeeping
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: [check-releases, merge-manifest]
@@ -2496,6 +2521,7 @@ jobs:
   # Job 8 — Update Docker Hub description (release tags only)
   # ============================================================================
   update-description:
+    timeout-minutes: 15
     name: Update Docker Hub Description
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: merge-manifest
@@ -2522,6 +2548,7 @@ jobs:
   # (renovate / nightly / release set) for observability and tooling.
   # ============================================================================
   update-state:
+    timeout-minutes: 15
     name: Update Pipeline State
     runs-on: ${{ vars.ACTION_RUNNER_VERSION || 'ubuntu-latest' }}
     needs: [check-releases, merge-manifest, sync-registries]
